@@ -1002,6 +1002,19 @@ file(GLOB BOARD_SOURCES
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
 
+# The esp32-s3-rlcd-4.2 board keeps helper managers and generated assets in
+# subdirectories of the board, so pick them up and expose their include root.
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2)
+    file(GLOB BOARD_SUB_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/managers/*.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/managers/*.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/assets/*.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/assets/*/*.c
+    )
+    list(APPEND SOURCES ${BOARD_SUB_SOURCES})
+    list(APPEND INCLUDE_DIRS "boards/${BOARD_DIR}")
+endif()
+
 # Select one audio engine for each chip family
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4 OR CONFIG_IDF_TARGET_ESP32S31)
     list(APPEND SOURCES "audio/engines/afe_audio_engine.cc")
@@ -1167,6 +1180,17 @@ if(CONFIG_IDF_TARGET_ESP32S3)
 endif()
 
 set(MAIN_PRIV_REQUIRES_EXTRA "")
+# The esp32-s3-rlcd-4.2 board keeps its own managers (weather, pomodoro, SD card,
+# lunar calendar) that talk HTTP, JSON, LVGL-on-LCD and SD/MMC directly.
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        esp_http_client
+        json
+        esp_lcd
+        sdmmc
+        esp_driver_sdmmc
+    )
+endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)
     list(APPEND MAIN_PRIV_REQUIRES_EXTRA espressif__ip101)
 endif()
@@ -1225,6 +1249,7 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_http_client
                         xiaozhi-fonts
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )

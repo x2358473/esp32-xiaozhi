@@ -1,338 +1,652 @@
+// CustomLcdDisplay 核心类
+//
+// 负责：
+// - 构造/析构（初始化 RLCD 驱动 + LVGL + 创建 UI）
+// - LVGL flush 回调（RGB565 → 1-bit 转换）
+// - AI 消息适配（重写小智的 SetChatMessage / SetEmotion / ClearChatMessages）
+// - 备忘录功能（加载/刷新备忘录列表）
+// - 基类方法重写（UpdateStatusBar / SetTheme）
+//
+// 其他功能拆分到独立文件：
+//   rlcd_driver.cc        - RLCD 硬件驱动
+//   weather_ui.cc          - 天气站 UI 布局
+//   music_ui.cc            - 音乐页 UI 布局
+//   data_update_task.cc    - 后台数据更新任务
+
 #include <vector>
+#include <string>
 #include <cstring>
+#include <cJSON.h>
 #include <freertos/FreeRTOS.h>
-#include <esp_lcd_panel_io.h>
+#include <freertos/task.h>
 #include <esp_log.h>
 #include <esp_err.h>
 #include "custom_lcd_display.h"
 #include "lcd_display.h"
 #include "esp_lvgl_port.h"
-#include "assets/lang_config.h"
 #include "settings.h"
 #include "config.h"
 #include "board.h"
+#include "application.h"
+#include "lvgl_theme.h"
+
+static const char *TAG = "CustomDisplay";
+
+// ===== 本板内置 48x48 单色表情（由 scripts/gen_emoji.py 生成）=====
+// twemoji 彩色图在 1-bit 屏上二值化后只剩黑块，改用线条表情
+LV_IMAGE_DECLARE(ui_img_emo_neutral);
+LV_IMAGE_DECLARE(ui_img_emo_happy);
+LV_IMAGE_DECLARE(ui_img_emo_laughing);
+LV_IMAGE_DECLARE(ui_img_emo_funny);
+LV_IMAGE_DECLARE(ui_img_emo_sad);
+LV_IMAGE_DECLARE(ui_img_emo_angry);
+LV_IMAGE_DECLARE(ui_img_emo_crying);
+LV_IMAGE_DECLARE(ui_img_emo_loving);
+LV_IMAGE_DECLARE(ui_img_emo_embarrassed);
+LV_IMAGE_DECLARE(ui_img_emo_surprised);
+LV_IMAGE_DECLARE(ui_img_emo_shocked);
+LV_IMAGE_DECLARE(ui_img_emo_thinking);
+LV_IMAGE_DECLARE(ui_img_emo_winking);
+LV_IMAGE_DECLARE(ui_img_emo_cool);
+LV_IMAGE_DECLARE(ui_img_emo_relaxed);
+LV_IMAGE_DECLARE(ui_img_emo_delicious);
+LV_IMAGE_DECLARE(ui_img_emo_kissy);
+LV_IMAGE_DECLARE(ui_img_emo_confident);
+LV_IMAGE_DECLARE(ui_img_emo_sleepy);
+LV_IMAGE_DECLARE(ui_img_emo_silly);
+LV_IMAGE_DECLARE(ui_img_emo_confused);
+LV_IMAGE_DECLARE(ui_img_emo_fear);
+LV_IMAGE_DECLARE(ui_img_emo_disgusted);
+LV_IMAGE_DECLARE(ui_img_emo_microchip_ai);
+
+static const lv_image_dsc_t* GetLocalEmojiImage(const char* emotion) {
+    struct Entry {
+        const char* name;
+        const lv_image_dsc_t* image;
+    };
+    static const Entry kTable[] = {
+        {"neutral", &ui_img_emo_neutral},
+        {"happy", &ui_img_emo_happy},
+        {"laughing", &ui_img_emo_laughing},
+        {"funny", &ui_img_emo_funny},
+        {"sad", &ui_img_emo_sad},
+        {"angry", &ui_img_emo_angry},
+        {"crying", &ui_img_emo_crying},
+        {"loving", &ui_img_emo_loving},
+        {"embarrassed", &ui_img_emo_embarrassed},
+        {"surprised", &ui_img_emo_surprised},
+        {"shocked", &ui_img_emo_shocked},
+        {"thinking", &ui_img_emo_thinking},
+        {"winking", &ui_img_emo_winking},
+        {"cool", &ui_img_emo_cool},
+        {"relaxed", &ui_img_emo_relaxed},
+        {"delicious", &ui_img_emo_delicious},
+        {"kissy", &ui_img_emo_kissy},
+        {"confident", &ui_img_emo_confident},
+        {"sleepy", &ui_img_emo_sleepy},
+        {"silly", &ui_img_emo_silly},
+        {"confused", &ui_img_emo_confused},
+        {"fear", &ui_img_emo_fear},
+        {"disgusted", &ui_img_emo_disgusted},
+        {"microchip_ai", &ui_img_emo_microchip_ai},
+    };
+    if (emotion == nullptr) return nullptr;
+    for (const auto& entry : kTable) {
+        if (strcmp(entry.name, emotion) == 0) return entry.image;
+    }
+    return nullptr;
+}
+
+// ===== LVGL flush 回调 =====
 
 void CustomLcdDisplay::Lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
     assert(disp != NULL);
-    CustomLcdDisplay *Disp = (CustomLcdDisplay *)lv_display_get_user_data(disp);
+    CustomLcdDisplay *self = (CustomLcdDisplay *)lv_display_get_user_data(disp);
+    RlcdDriver *rlcd = self->rlcd_;
     uint16_t *buffer = (uint16_t *)color_p;
-  	for(int y = area->y1; y <= area->y2; y++)
-  	{
-  	 	for(int x = area->x1; x <= area->x2; x++) 
-  	 	{
-  	 	   	uint8_t color = (*buffer < 0x7fff) ? ColorBlack : ColorWhite;
-  	 	   	Disp->RLCD_SetPixel(x,y,color);
-  	 	   	buffer++;
-  	 	}
-  	}
-  	Disp->RLCD_Display();
-	lv_disp_flush_ready(disp);
+    for(int y = area->y1; y <= area->y2; y++)
+    {
+        for(int x = area->x1; x <= area->x2; x++) 
+        {
+            const uint16_t px = *buffer++;
+            // RGB565 -> 亮度（0..255 近似，权重和为 256 避免除法）
+            const uint16_t r5 = (px >> 11) & 0x1F;
+            const uint16_t g6 = (px >> 5) & 0x3F;
+            const uint16_t b5 = px & 0x1F;
+            const uint16_t luma = (r5 * 616 + g6 * 600 + b5 * 232) >> 8;
+
+            // 1-bit 硬二值化，阈值 160（约 63% 亮度）：
+            // 偏向保留深色笔画，让 4bpp 抗锯齿小字的边缘尽量连成实线。
+            // 不用 Bayer 抖动——抖动会把字体的灰度边缘打散成网点，小字明显发虚。
+            const uint8_t color = (luma < 160) ? ColorBlack : ColorWhite;
+            rlcd->RLCD_SetPixel(x, y, color);
+        }
+    }
+    rlcd->RLCD_Display();
+    lv_disp_flush_ready(disp);
 }
 
+// ===== 构造 / 析构 =====
+
 CustomLcdDisplay::CustomLcdDisplay(esp_lcd_panel_io_handle_t panel_io,
-esp_lcd_panel_handle_t panel,
-int width, 
-int height, 
-int offset_x, 
-int offset_y,
-bool mirror_x, 
-bool mirror_y, 
-bool swap_xy,
-spi_display_config_t spiconfig,
-spi_host_device_t spi_host) : LcdDisplay(panel_io, panel, width, height),
-mosi_(spiconfig.mosi),
-scl_(spiconfig.scl), 
-dc_(spiconfig.dc), 
-cs_(spiconfig.cs), 
-rst_(spiconfig.rst), 
-width_(width), 
-height_(height)
+    esp_lcd_panel_handle_t panel,
+    int width, int height, int offset_x, int offset_y,
+    bool mirror_x, bool mirror_y, bool swap_xy,
+    spi_display_config_t spiconfig,
+    spi_host_device_t spi_host) : LcdDisplay(panel_io, panel, width, height)
 {
-	ESP_LOGI(TAG, "Initialize SPI");
-	esp_err_t        ret;
-    spi_bus_config_t buscfg   = {};
-    int              transfer = width_ * height_;
-    buscfg.miso_io_num                   = -1;
-    buscfg.mosi_io_num                   = mosi_;
-    buscfg.sclk_io_num                   = scl_;
-    buscfg.quadwp_io_num                 = -1;
-    buscfg.quadhd_io_num                 = -1;
-    buscfg.max_transfer_sz               = transfer;
-    ret                                  = spi_bus_initialize(spi_host, &buscfg, SPI_DMA_CH_AUTO);
-    ESP_ERROR_CHECK(ret);
-    esp_lcd_panel_io_spi_config_t io_config = {};
-    io_config.dc_gpio_num = static_cast<gpio_num_t>(dc_);
-    io_config.cs_gpio_num = static_cast<gpio_num_t>(cs_);
-    io_config.pclk_hz = 40 * 1000 * 1000;
-    io_config.lcd_cmd_bits = 8;
-    io_config.lcd_param_bits = 8;
-    io_config.spi_mode = 0;
-    io_config.trans_queue_depth = 7;
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)spi_host, &io_config, &io_handle));
-    gpio_config_t gpio_conf = {};
-    gpio_conf.intr_type     = GPIO_INTR_DISABLE;
-    gpio_conf.mode          = GPIO_MODE_OUTPUT;
-    gpio_conf.pin_bit_mask  = (0x1ULL << rst_);
-    gpio_conf.pull_down_en  = GPIO_PULLDOWN_DISABLE;
-    gpio_conf.pull_up_en    = GPIO_PULLUP_ENABLE;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&gpio_conf));
-    Set_ResetIOLevel(1);
+    // 1. 初始化 RLCD 硬件驱动
+    rlcd_ = new RlcdDriver(spiconfig, width, height, spi_host);
 
-    DisplayLen                = transfer >> 3; //(1byte 8ipex)
-    DispBuffer                = (uint8_t *) heap_caps_malloc(DisplayLen, MALLOC_CAP_SPIRAM);
-    assert(DispBuffer);
-	PixelIndexLUT = (uint16_t (*)[300])heap_caps_malloc(transfer * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-	PixelBitLUT   = (uint8_t (*)[300])heap_caps_malloc(transfer * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-    assert(PixelIndexLUT);
-    assert(PixelBitLUT);
-    if(width_ == 400) {
-        InitLandscapeLUT();
-    } else {
-        InitPortraitLUT();
-    }
-
-    ESP_LOGI(TAG, "Initialize LVGL library");
+    // 2. 初始化 LVGL
+    ESP_LOGI(TAG, "初始化 LVGL");
     lv_init();
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
-    port_cfg.task_priority   = 2;
+    port_cfg.task_priority = 2;
     port_cfg.timer_period_ms = 50;
     lvgl_port_init(&port_cfg);
     lvgl_port_lock(0);
 
-    display_ = lv_display_create(width, height); /* 以水平和垂直分辨率（像素）进行基本初始化 */
+    int transfer = width * height;
+    display_ = lv_display_create(width, height);
     lv_display_set_flush_cb(display_, Lvgl_flush_cb);
     lv_display_set_user_data(display_, this);
-	size_t lvgl_buffer_size = LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565) * transfer;
-	uint8_t *lvgl_buffer1 = (uint8_t *) heap_caps_malloc(lvgl_buffer_size, MALLOC_CAP_SPIRAM);
+    size_t lvgl_buffer_size = LV_COLOR_FORMAT_GET_SIZE(LV_COLOR_FORMAT_RGB565) * transfer;
+    uint8_t *lvgl_buffer1 = (uint8_t *)heap_caps_malloc(lvgl_buffer_size, MALLOC_CAP_SPIRAM);
     assert(lvgl_buffer1);
-	lv_display_set_buffers(display_, lvgl_buffer1, NULL, lvgl_buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(display_, lvgl_buffer1, NULL, lvgl_buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    ESP_LOGI(TAG, "RLCD init");
-    RLCD_Init();
+    // 3. 初始化 RLCD 屏幕
+    ESP_LOGI(TAG, "初始化 RLCD 屏幕");
+    rlcd_->RLCD_Init();
 
     lvgl_port_unlock();
     if (display_ == nullptr) {
-        ESP_LOGE(TAG, "Failed to add display");
+        ESP_LOGE(TAG, "显示初始化失败");
         return;
     }
 
-    // Note: SetupUI() should be called by Application::Initialize(), not in constructor
-    // to ensure lvgl objects are created after the display is fully initialized.
+    // 4. 创建天气页 + 音乐页 + 番茄钟页 UI
+    ESP_LOGI(TAG, "创建天气页 + 音乐页 + 番茄钟页 UI");
+    SetupWeatherUI();
+    SetupMusicUI();
+    SetupPomodoroUI();
+    // 告诉显示框架：当前自定义 UI 已经初始化完成
+    // 否则基类的 SetStatus/ShowNotification 会一直误判为“UI 未准备好”
+    setup_ui_called_ = true;
+    {
+        // LVGL 任务已在 lvgl_port_init 后运行，此处改控件必须持锁
+        DisplayLockGuard lock(this);
+        ApplyDisplayMode();
+    }
+
+    // 5. 启动时从 NVS 加载上次保存的备忘录
+    LoadMemoFromNvs();
 }
 
 CustomLcdDisplay::~CustomLcdDisplay() {
+    if (update_task_handle_) {
+        vTaskDelete(update_task_handle_);
+        update_task_handle_ = nullptr;
+    }
+    // 基类析构会 lv_display_delete，期间可能调用 flush 回调访问 rlcd_，
+    // 先把 flush 回调置空再释放驱动，避免 use-after-free
+    if (display_) {
+        lv_display_set_flush_cb(display_, [](lv_display_t*, const lv_area_t*, uint8_t*) {});
+    }
+    delete rlcd_;
+    rlcd_ = nullptr;
 }
 
-void CustomLcdDisplay::InitPortraitLUT() {
-    uint16_t W4 = width_ >> 2;
-    for (uint16_t y = 0; y < height_; y++)
-    {
-        uint16_t byte_y = y >> 1;
-        uint8_t  local_y = y & 1;
-        for (uint16_t x = 0; x < width_; x++)
-        {
-            uint16_t byte_x = x >> 2;
-            uint8_t  local_x = x & 3;
+// ===== 备忘录功能 =====
 
-            uint32_t index = byte_y * W4 + byte_x;
-            uint8_t bit = 7 - ((local_x << 1) | local_y);
+void CustomLcdDisplay::LoadMemoFromNvs() {
+    // 直接调用 RefreshMemoDisplay 从 NVS 读取并更新 UI
+    RefreshMemoDisplay();
+}
 
-            PixelIndexLUT[x][y] = index;
-            PixelBitLUT  [x][y] = (1 << bit);
+// 内部版本：不获取锁（调用者必须已持有 DisplayLock）
+void CustomLcdDisplay::RefreshMemoDisplayInternal() {
+    if (!memo_list_label_) return;
+
+    // 从 NVS 读取 JSON 数组
+    Settings settings("memo", false);
+    std::string json_str = settings.GetString("items", "");
+
+    if (json_str.empty()) {
+        lv_label_set_text(memo_list_label_, "暂无待办");
+        return;
+    }
+
+    cJSON *arr = cJSON_Parse(json_str.c_str());
+    if (!arr || !cJSON_IsArray(arr)) {
+        lv_label_set_text(memo_list_label_, "暂无待办");
+        if (arr) cJSON_Delete(arr);
+        return;
+    }
+
+    // 格式化每条备忘为一行: "时间 内容"
+    // 卡片高度约 90px，16px 字体每行约 18px，最多显示约 5 行
+    std::string display_text;
+    int count = cJSON_GetArraySize(arr);
+    for (int i = 0; i < count && i < 5; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        cJSON *t = cJSON_GetObjectItem(item, "t");
+        cJSON *c = cJSON_GetObjectItem(item, "c");
+
+        if (i > 0) display_text += "\n";
+
+        // 格式：[时间] 内容  或  · 内容（无时间时）
+        if (t && cJSON_IsString(t) && strlen(t->valuestring) > 0) {
+            display_text += t->valuestring;
+            display_text += " ";
+        } else {
+            display_text += "· ";
         }
+        if (c && cJSON_IsString(c)) {
+            display_text += c->valuestring;
+        }
+    }
+
+    // 如果超过 5 条，提示还有更多
+    if (count > 5) {
+        display_text += "\n...还有" + std::to_string(count - 5) + "条";
+    }
+
+    cJSON_Delete(arr);
+    lv_label_set_text(memo_list_label_, display_text.c_str());
+    ESP_LOGI(TAG, "备忘列表已刷新，共 %d 条", count);
+}
+
+// 外部版本：自动获取锁（供 MCP 工具等外部调用）
+void CustomLcdDisplay::RefreshMemoDisplay() {
+    DisplayLockGuard lock(this);
+    RefreshMemoDisplayInternal();
+}
+
+// 系统信息滚动超时退出：恢复聊天标签布局，避免仪表盘永久冻结
+void CustomLcdDisplay::ExitSystemInfoMode() {
+    if (!showing_system_info_.load()) return;
+
+    {
+        DisplayLockGuard lock(this);
+        SetShowingSystemInfo(false);
+        if (chat_status_label_) {
+            lv_anim_delete(chat_status_label_, nullptr);
+            lv_label_set_long_mode(chat_status_label_, LV_LABEL_LONG_WRAP);
+            lv_obj_align(chat_status_label_, LV_ALIGN_LEFT_MID, 64 + 20, 0);
+            lv_label_set_text(chat_status_label_, "");
+        }
+        if (music_chat_status_label_) {
+            lv_label_set_text(music_chat_status_label_, "");
+        }
+        if (pomo_chat_status_label_) {
+            lv_label_set_text(pomo_chat_status_label_, "");
+        }
+    }
+
+    // 强制下一轮刷新时间/日期（last_min_ 被系统信息模式冻结过）
+    last_min_ = -1;
+    ESP_LOGI("CustomLcdDisplay", "系统信息模式已超时退出");
+}
+
+// ===== AI 消息适配（重写小智的方法，只更新左下角卡片）=====
+
+void CustomLcdDisplay::SetChatMessage(const char* role, const char* content) {
+    DisplayLockGuard lock(this);
+    if (chat_status_label_ == nullptr) return;  // 主标签为空时后续 lv_* 会解引用 NULL
+    if (!content || strlen(content) == 0) return;
+
+    // 停止可能正在运行的滚动动画（系统信息或之前的 AI 滚动）
+    lv_anim_delete(chat_status_label_, nullptr);
+    
+    // 停止系统信息滚动，恢复 DataUpdateTask 更新
+    SetShowingSystemInfo(false);
+    
+    // 设置文本内容
+    lv_label_set_text(chat_status_label_, content);
+    lv_label_set_long_mode(chat_status_label_, LV_LABEL_LONG_WRAP);
+    
+    // 先恢复居中对齐（正常模式），计算内容高度
+    lv_obj_align(chat_status_label_, LV_ALIGN_LEFT_MID, 64 + 20, 0);
+    
+    // 检查内容是否超出父容器（chat_inner）的可见高度
+    lv_obj_update_layout(chat_status_label_);
+    int label_h = lv_obj_get_height(chat_status_label_);
+    // 从父容器动态获取高度，不硬编码（父容器是 chat_inner）
+    lv_obj_t *parent = lv_obj_get_parent(chat_status_label_);
+    int visible_h = parent ? lv_obj_get_content_height(parent) : 108;
+    
+    if (label_h > visible_h) {
+        // 超长内容：切换到 TOP_LEFT 绝对定位后启用滚动
+        // （和鱼咬尾同理，LEFT_MID 对齐会干扰动画的 set_y）
+        const int text_x = 64 + 20;
+        lv_obj_align(chat_status_label_, LV_ALIGN_TOP_LEFT, text_x, 0);
+        
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, chat_status_label_);
+        lv_anim_set_values(&a, 0, -(label_h - visible_h));  // 从顶部滚到底部
+        lv_anim_set_delay(&a, 1500);  // 开始前停顿 1.5 秒
+        lv_anim_set_duration(&a, (label_h - visible_h) * 50);  // 速度：每像素 50ms
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_repeat_delay(&a, 2000);  // 滚完后暂停 2 秒再重新开始
+        lv_anim_set_exec_cb(&a, [](void *obj, int32_t v) {
+            lv_obj_set_y((lv_obj_t *)obj, v);
+        });
+        lv_anim_start(&a);
+        
+        ESP_LOGI("CustomLcdDisplay", "AI 回答过长（%dpx > %dpx），启用慢速滚动", label_h, visible_h);
+    }
+
+    // 音乐页同步显示 AI 文案
+    if (music_chat_status_label_) {
+        lv_label_set_long_mode(music_chat_status_label_, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(music_chat_status_label_, content);
+    }
+    // 番茄钟页同步显示 AI 文案
+    if (pomo_chat_status_label_) {
+        lv_label_set_long_mode(pomo_chat_status_label_, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(pomo_chat_status_label_, content);
     }
 }
 
-void CustomLcdDisplay::InitLandscapeLUT() {
-    uint16_t H4 = height_ >> 2;
-    for (uint16_t y = 0; y < height_; y++)
-    {
-        uint16_t inv_y = height_ - 1 - y;
-        uint16_t block_y = inv_y >> 2;
-        uint8_t  local_y  = inv_y & 3;
-        for (uint16_t x = 0; x < width_; x++)
-        {
-            uint16_t byte_x = x >> 1;
-            uint8_t  local_x = x & 1;
+bool CustomLcdDisplay::SetEmotion(const char* emotion) {
+    DisplayLockGuard lock(this);
+    if (emotion == nullptr) {
+        emotion = "neutral";
+    }
+    
+    // 1. 更新左侧文字（完整映射小智所有 21 种表情 + 额外状态）
+    const char* text = "待命";
+    if (strcmp(emotion, "neutral") == 0)         text = "待命";
+    else if (strcmp(emotion, "happy") == 0)      text = "开心";
+    else if (strcmp(emotion, "laughing") == 0)   text = "大笑";
+    else if (strcmp(emotion, "funny") == 0)      text = "搞笑";
+    else if (strcmp(emotion, "sad") == 0)        text = "难过";
+    else if (strcmp(emotion, "angry") == 0)      text = "生气";
+    else if (strcmp(emotion, "crying") == 0)     text = "哭泣";
+    else if (strcmp(emotion, "loving") == 0)     text = "喜爱";
+    else if (strcmp(emotion, "embarrassed") == 0) text = "害羞";
+    else if (strcmp(emotion, "surprised") == 0)  text = "惊讶";
+    else if (strcmp(emotion, "shocked") == 0)    text = "震惊";
+    else if (strcmp(emotion, "thinking") == 0)   text = "思考";
+    else if (strcmp(emotion, "winking") == 0)    text = "眨眼";
+    else if (strcmp(emotion, "cool") == 0)       text = "耍酷";
+    else if (strcmp(emotion, "relaxed") == 0)    text = "放松";
+    else if (strcmp(emotion, "delicious") == 0)  text = "好吃";
+    else if (strcmp(emotion, "kissy") == 0)      text = "亲亲";
+    else if (strcmp(emotion, "confident") == 0)  text = "自信";
+    else if (strcmp(emotion, "sleepy") == 0)     text = "犯困";
+    else if (strcmp(emotion, "silly") == 0)      text = "调皮";
+    else if (strcmp(emotion, "confused") == 0)   text = "困惑";
+    // 额外状态
+    else if (strcmp(emotion, "fear") == 0)       text = "害怕";
+    else if (strcmp(emotion, "disgusted") == 0)  text = "嫌弃";
+    else if (strcmp(emotion, "microchip_ai") == 0) text = "就绪";
+    // 未知情绪也显示中文，不显示英文原文
+    else                                         text = "待命";
+    
+    if (emotion_label_) {
+        lv_label_set_text(emotion_label_, text);
+    }
+    if (music_emotion_label_) {
+        lv_label_set_text(music_emotion_label_, text);
+    }
+    if (pomo_emotion_label_) {
+        lv_label_set_text(pomo_emotion_label_, text);
+    }
+    
+    // 2. 使用本板内置的 48x48 单色表情（三页同步）
+    // 不用 theme 的彩色 twemoji：在 1-bit 屏上二值化后只剩黑块，看不出表情
+    ApplyEmotionImageInternal(emotion);
+    return true;
+}
 
-            uint32_t index = byte_x * H4 + block_y;
-            uint8_t bit = 7 - ((local_y << 1) | local_x);
+void CustomLcdDisplay::SetEmotionImage(const char* emotion) {
+    DisplayLockGuard lock(this);
+    ApplyEmotionImageInternal(emotion);
+}
 
-            PixelIndexLUT[x][y] = index;
-            PixelBitLUT  [x][y] = (1 << bit);
+void CustomLcdDisplay::ApplyEmotionImageInternal(const char* emotion) {
+    const lv_image_dsc_t* local_emoji = GetLocalEmojiImage(emotion);
+    auto apply_emoji = [local_emoji](lv_obj_t* img) {
+        if (img == nullptr) return;
+        if (local_emoji != nullptr) {
+            lv_image_set_src(img, local_emoji);
+            lv_obj_remove_flag(img, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(img, LV_OBJ_FLAG_HIDDEN);
         }
+    };
+    apply_emoji(emotion_img_);
+    apply_emoji(music_emotion_img_);
+    apply_emoji(pomo_emotion_img_);
+}
+
+void CustomLcdDisplay::ClearChatMessages() {
+    DisplayLockGuard lock(this);
+    if (chat_status_label_) lv_label_set_text(chat_status_label_, "");
+    if (music_chat_status_label_) lv_label_set_text(music_chat_status_label_, "");
+    if (pomo_chat_status_label_) lv_label_set_text(pomo_chat_status_label_, "");
+    // 表情不清除，保持常驻
+}
+
+// ===== 重写 SetupUI：隐藏 2.6 基类自建的整套 UI =====
+
+void CustomLcdDisplay::SetupUI() {
+    LcdDisplay::SetupUI();
+    DisplayLockGuard lock(this);
+    // 基类 SetupUI 会在 lv_screen_active() 上建全屏 container_（含 top_bar_/content_/表情图）
+    // 和顶部 status_bar_（含 status_label_，会显示 "Standby"/"Initializing" 之类文字）。
+    // 本类的三个页面在构造函数里已建好，这里把基类那套全部隐藏，避免叠加与遮挡。
+    if (container_ != nullptr) {
+        lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (status_bar_ != nullptr) {
+        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
+    }
+    ApplyDisplayMode();
+    ESP_LOGI(TAG, "SetupUI: 已隐藏基类 container_/status_bar_，恢复自有页面");
+}
+
+// ===== 重写 SetStatus：基类状态文字在本类没有对应区域 =====
+
+void CustomLcdDisplay::SetStatus(const char* status) {
+    // 不调用基类实现：基类会把文字写进 status_label_（顶部状态栏），
+    // 该区域已隐藏，写了也不会显示，且会与自有卡片布局争抢刷新。
+    ESP_LOGD(TAG, "忽略基类状态文字: %s", status ? status : "(null)");
+}
+
+// ===== 重写状态栏更新（禁用基类的 Font Awesome 文字更新）=====
+
+void CustomLcdDisplay::UpdateStatusBar(bool update_all) {
+    // 不调用基类实现！
+    // 基类会尝试用 lv_label_set_text 更新 network_label_ 和 battery_label_，
+    // 但那些是隐藏的占位标签。我们自己的图片图标由 DataUpdateTask 管理。
+}
+
+// ===== 重写主题切换 =====
+
+void CustomLcdDisplay::SetTheme(Theme* theme) {
+    // RLCD 是 1-bit 单色屏，只有黑白两色，不做视觉主题切换
+    // （基类会操作我们没创建的 container_/content_/top_bar_）。
+    // 但主题名必须落到 NVS，否则每次启动都恢复不了上次选择。
+    current_theme_ = theme;
+    {
+        Settings settings("display", true);
+        settings.SetString("theme", theme ? theme->name() : "");
+    }
+    ESP_LOGI(TAG, "RLCD 单色屏，跳过主题 UI 切换（已保存 theme 指针）");
+}
+
+void CustomLcdDisplay::ApplyDisplayMode() {
+    // 先隐藏所有页面
+    if (weather_page_) lv_obj_add_flag(weather_page_, LV_OBJ_FLAG_HIDDEN);
+    if (music_page_) lv_obj_add_flag(music_page_, LV_OBJ_FLAG_HIDDEN);
+    if (pomodoro_page_) lv_obj_add_flag(pomodoro_page_, LV_OBJ_FLAG_HIDDEN);
+
+    // 显示当前页面
+    switch (display_mode_) {
+        case MODE_WEATHER:
+            if (weather_page_) lv_obj_remove_flag(weather_page_, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case MODE_MUSIC:
+            if (music_page_) lv_obj_remove_flag(music_page_, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case MODE_POMODORO:
+            if (pomodoro_page_) lv_obj_remove_flag(pomodoro_page_, LV_OBJ_FLAG_HIDDEN);
+            break;
     }
 }
 
-void CustomLcdDisplay::Set_ResetIOLevel(uint8_t level) {
-    gpio_set_level((gpio_num_t) rst_, level ? 1 : 0);
+void CustomLcdDisplay::CycleDisplayMode() {
+    DisplayLockGuard lock(this);
+    // 三页循环：天气 → 音乐 → 番茄钟 → 天气
+    switch (display_mode_) {
+        case MODE_WEATHER:  display_mode_ = MODE_MUSIC; break;
+        case MODE_MUSIC:    display_mode_ = MODE_POMODORO; break;
+        case MODE_POMODORO: display_mode_ = MODE_WEATHER; break;
+    }
+    ApplyDisplayMode();
+    const char* name = "未知";
+    switch (display_mode_) {
+        case MODE_WEATHER:  name = "天气页"; break;
+        case MODE_MUSIC:    name = "音乐页"; break;
+        case MODE_POMODORO: name = "番茄钟"; break;
+    }
+    ESP_LOGI(TAG, "页面切换: %s", name);
 }
 
-void CustomLcdDisplay::RLCD_SendCommand(uint8_t Reg) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, Reg, NULL, 0));
+void CustomLcdDisplay::SetMusicInfo(const char* title, const char* artist) {
+    DisplayLockGuard lock(this);
+    if (music_title_label_ == nullptr || music_artist_label_ == nullptr) {
+        return;
+    }
+    lv_label_set_text(music_title_label_, (title && strlen(title) > 0) ? title : "未知歌曲");
+    lv_label_set_text(music_artist_label_, (artist && strlen(artist) > 0) ? artist : "未知歌手");
 }
 
-void CustomLcdDisplay::RLCD_SendData(uint8_t Data) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, -1, &Data, 1));
+void CustomLcdDisplay::SetMusicLyric(const char* lyric) {
+    DisplayLockGuard lock(this);
+    if (music_lyric_label_ == nullptr) {
+        return;
+    }
+
+    // 歌词格式："上一句\n当前句\n下一句"（由 application.cc 拼接）
+    // 如果没有 \n 分隔符，说明是单行文本（如错误提示），直接显示在当前行
+    std::string text(lyric ? lyric : "");
+    std::string prev_line, curr_line, next_line;
+
+    size_t first_nl = text.find('\n');
+    if (first_nl != std::string::npos) {
+        prev_line = text.substr(0, first_nl);
+        size_t second_nl = text.find('\n', first_nl + 1);
+        if (second_nl != std::string::npos) {
+            curr_line = text.substr(first_nl + 1, second_nl - first_nl - 1);
+            next_line = text.substr(second_nl + 1);
+        } else {
+            curr_line = text.substr(first_nl + 1);
+        }
+    } else {
+        // 单行文本（错误提示等），只显示在当前行
+        curr_line = text;
+    }
+
+    // 更新三个 label
+    if (music_lyric_prev_label_) {
+        lv_label_set_text(music_lyric_prev_label_, prev_line.c_str());
+    }
+    lv_label_set_text(music_lyric_label_, curr_line.c_str());
+    if (music_lyric_next_label_) {
+        lv_label_set_text(music_lyric_next_label_, next_line.c_str());
+    }
 }
 
-void CustomLcdDisplay::RLCD_Sendbuffera(uint8_t *Data, int len) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, -1, Data, len));
+void CustomLcdDisplay::SetMusicProgress(uint32_t current_ms, uint32_t total_ms) {
+    DisplayLockGuard lock(this);
+    if (music_progress_bar_ == nullptr || music_progress_label_ == nullptr) {
+        return;
+    }
+
+    if (total_ms > 0) {
+        // 有总时长（来自歌词）：正常显示进度条和 "当前 / 总时长"
+        if (current_ms > total_ms) {
+            current_ms = total_ms;
+        }
+        lv_bar_set_range(music_progress_bar_, 0, static_cast<int32_t>(total_ms));
+        lv_bar_set_value(music_progress_bar_, static_cast<int32_t>(current_ms), LV_ANIM_OFF);
+
+        char progress_text[32];
+        snprintf(progress_text, sizeof(progress_text), "%02lu:%02lu / %02lu:%02lu",
+                 static_cast<unsigned long>(current_ms / 60000),
+                 static_cast<unsigned long>((current_ms / 1000) % 60),
+                 static_cast<unsigned long>(total_ms / 60000),
+                 static_cast<unsigned long>((total_ms / 1000) % 60));
+        lv_label_set_text(music_progress_label_, progress_text);
+    } else {
+        // 无总时长（没有歌词）：进度条不动，只显示已播放时间
+        char progress_text[32];
+        snprintf(progress_text, sizeof(progress_text), "%02lu:%02lu",
+                 static_cast<unsigned long>(current_ms / 60000),
+                 static_cast<unsigned long>((current_ms / 1000) % 60));
+        lv_label_set_text(music_progress_label_, progress_text);
+    }
 }
 
-void CustomLcdDisplay::RLCD_Reset(void) {
-    Set_ResetIOLevel(1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    Set_ResetIOLevel(0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    Set_ResetIOLevel(1);
-    vTaskDelay(pdMS_TO_TICKS(50));
+void CustomLcdDisplay::SwitchToMusicPage() {
+    DisplayLockGuard lock(this);
+    if (display_mode_ != MODE_MUSIC) {
+        display_mode_ = MODE_MUSIC;
+        ApplyDisplayMode();
+        ESP_LOGI(TAG, "自动切换到音乐页");
+    }
 }
 
-void CustomLcdDisplay::RLCD_ColorClear(uint8_t color) {
-    memset(DispBuffer, color, DisplayLen);
+void CustomLcdDisplay::SwitchToWeatherPage() {
+    DisplayLockGuard lock(this);
+    if (display_mode_ != MODE_WEATHER) {
+        display_mode_ = MODE_WEATHER;
+        ApplyDisplayMode();
+        ESP_LOGI(TAG, "自动切换到天气页");
+    }
 }
 
-void CustomLcdDisplay::RLCD_Init() {
-    RLCD_Reset();
+// ===== 番茄钟页面方法 =====
 
-    RLCD_SendCommand(0xD6);  // NVM Load Control
-	RLCD_SendData(0x17);
-	RLCD_SendData(0x02);
-
-	RLCD_SendCommand(0xD1); //Booster Enable
-	RLCD_SendData(0x01);
-
-	RLCD_SendCommand(0xC0); //Gate Voltage Control
-	RLCD_SendData(0x11);   
-	RLCD_SendData(0x04);   
-
-	RLCD_SendCommand(0xC1); //VSHP Setting
-	RLCD_SendData(0x69);
-	RLCD_SendData(0x69);
-	RLCD_SendData(0x69);
-	RLCD_SendData(0x69);
-
-	RLCD_SendCommand(0xC2);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-
-	RLCD_SendCommand(0xC4);
-	RLCD_SendData(0x4B);
-	RLCD_SendData(0x4B);
-	RLCD_SendData(0x4B);
-	RLCD_SendData(0x4B);
-
-	RLCD_SendCommand(0xC5);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-	RLCD_SendData(0x19);
-
-	RLCD_SendCommand(0xD8);
-	RLCD_SendData(0x80);
-	RLCD_SendData(0xE9);
-
-	RLCD_SendCommand(0xB2);
-	RLCD_SendData(0x02);
-
-	RLCD_SendCommand(0xB3);
-	RLCD_SendData(0xE5);
-	RLCD_SendData(0xF6);
-	RLCD_SendData(0x05);
-	RLCD_SendData(0x46);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x76);
-	RLCD_SendData(0x45);
-
-	RLCD_SendCommand(0xB4);
-	RLCD_SendData(0x05);
-	RLCD_SendData(0x46);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x77);
-	RLCD_SendData(0x76);
-	RLCD_SendData(0x45);
-
-	RLCD_SendCommand(0x62);
-	RLCD_SendData(0x32);
-	RLCD_SendData(0x03);
-	RLCD_SendData(0x1F);
-
-	RLCD_SendCommand(0xB7);
-	RLCD_SendData(0x13);
-
-	RLCD_SendCommand(0xB0);
-	RLCD_SendData(0x64);
-
-	RLCD_SendCommand(0x11); 
-	vTaskDelay(pdMS_TO_TICKS(200));     
-	RLCD_SendCommand(0xC9);
-	RLCD_SendData(0x00);
-
-	RLCD_SendCommand(0x36);
-	RLCD_SendData(0x48); 
-
-	RLCD_SendCommand(0x3A);
-	RLCD_SendData(0x11); 
-
-	RLCD_SendCommand(0xB9);
-	RLCD_SendData(0x20);
-
-	RLCD_SendCommand(0xB8);
-	RLCD_SendData(0x29);
-
-	RLCD_SendCommand(0x21);
-
-	RLCD_SendCommand(0x2A); 
-	RLCD_SendData(0x12);
-	RLCD_SendData(0x2A);
-
-	RLCD_SendCommand(0x2B); 
-	RLCD_SendData(0x00);
-	RLCD_SendData(0xC7);
-
-	RLCD_SendCommand(0x35);
-	RLCD_SendData(0x00);
-
-	RLCD_SendCommand(0xD0);
-	RLCD_SendData(0xFF);
-
-	RLCD_SendCommand(0x38);
-	RLCD_SendCommand(0x29);
-
-    RLCD_ColorClear(ColorWhite);
+void CustomLcdDisplay::SwitchToPomodoroPage() {
+    DisplayLockGuard lock(this);
+    if (display_mode_ != MODE_POMODORO) {
+        display_mode_ = MODE_POMODORO;
+        ApplyDisplayMode();
+        ESP_LOGI(TAG, "自动切换到番茄钟页");
+    }
 }
 
-void CustomLcdDisplay::RLCD_SetPixel(uint16_t x, uint16_t y, uint8_t color) {
-    uint32_t idx = PixelIndexLUT[x][y];
-    uint8_t  mask = PixelBitLUT[x][y];
-
-    uint8_t *p = &DispBuffer[idx];
-
-    if (color)
-        *p |= mask;
-    else
-        *p &= ~mask;
+void CustomLcdDisplay::UpdatePomodoroDisplay(const char* state_text, const char* countdown_text,
+                                              int progress_permille, const char* info_text) {
+    DisplayLockGuard lock(this);
+    if (pomo_state_label_ && state_text) {
+        lv_label_set_text(pomo_state_label_, state_text);
+    }
+    if (pomo_countdown_label_ && countdown_text) {
+        lv_label_set_text(pomo_countdown_label_, countdown_text);
+    }
+    if (pomo_progress_bar_) {
+        lv_bar_set_value(pomo_progress_bar_, progress_permille, LV_ANIM_OFF);
+    }
+    if (pomo_info_label_ && info_text) {
+        lv_label_set_text(pomo_info_label_, info_text);
+    }
 }
 
-void CustomLcdDisplay::RLCD_Display() {
-    RLCD_SendCommand(0x2A);     // Column Address Set
-  	RLCD_SendData(0x12);
-  	RLCD_SendData(0x2A);
+// ===== 省电模式 =====
 
-  	RLCD_SendCommand(0x2B);     // Page Address Set
-  	RLCD_SendData(0x00);
-  	RLCD_SendData(0xC7);
-
-  	RLCD_SendCommand(0x2c);     // Page Address Set
-
-	RLCD_Sendbuffera(DispBuffer,DisplayLen);
+void CustomLcdDisplay::NotifyUserActivity() {
+    last_activity_ms_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (power_saving_) {
+        power_saving_ = false;
+        ESP_LOGI(TAG, "用户活动检测到，退出省电模式");
+    }
 }

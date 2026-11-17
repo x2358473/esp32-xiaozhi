@@ -300,8 +300,8 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
-            // Print debug info every 10 seconds
-            if (clock_ticks_ % 10 == 0) {
+            // Print debug info every 5 minutes (降低日志唤醒频率，省电)
+            if (clock_ticks_ % 300 == 0) {
                 SystemInfo::PrintHeapStats();
                 // SystemInfo::PrintTaskList();
                 // SystemInfo::PrintTaskCpuUsage(pdMS_TO_TICKS(1000));

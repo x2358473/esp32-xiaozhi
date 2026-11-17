@@ -63,6 +63,18 @@ public:
     virtual bool IsMonochrome() const { return false; }
     virtual bool SupportsGuiOperations() const { return false; }
     virtual void SetHideSubtitle(bool hide) { (void)hide; }
+    // Music page hooks: only the esp32-s3-rlcd-4.2 board renders them.
+    virtual void SetMusicInfo(const char* title, const char* artist) {
+        (void)title;
+        (void)artist;
+    }
+    virtual void SetMusicLyric(const char* lyric) { (void)lyric; }
+    virtual void SetMusicProgress(uint32_t current_ms, uint32_t total_ms) {
+        (void)current_ms;
+        (void)total_ms;
+    }
+    virtual void SwitchToMusicPage() {}
+    virtual void SwitchToWeatherPage() {}
     virtual bool InsertAnimDialog(const char* name, uint32_t duration_ms) {
         (void)name;
         (void)duration_ms;

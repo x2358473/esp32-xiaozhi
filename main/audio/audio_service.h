@@ -148,6 +148,8 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+    // Board hook: keep the output channel open while an external source plays (white noise, HTTP music).
+    void SetExternalPlaybackActive(bool active);
 
 private:
     AudioCodec* codec_ = nullptr;
@@ -211,6 +213,7 @@ private:
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
     std::chrono::steady_clock::time_point last_output_time_;
+    bool external_playback_active_ = false;
 
     void AudioInputTask();
     void AudioOutputTask();

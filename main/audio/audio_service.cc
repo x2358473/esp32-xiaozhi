@@ -834,6 +834,21 @@ bool AudioService::MarkPlaybackDrainedLocked() {
     return true;
 }
 
+void AudioService::SetExternalPlaybackActive(bool active) {
+    external_playback_active_ = active;
+    last_output_time_ = std::chrono::steady_clock::now();
+
+    if (active) {
+        // External playback (white noise, HTTP music) keeps the output channel open so the
+        // power timer cannot close it mid-stream.
+        if (!codec_->output_enabled()) {
+            codec_->EnableOutput(true);
+        }
+        esp_timer_stop(audio_power_timer_);
+        esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+    }
+}
+
 void AudioService::CheckAndUpdateAudioPowerState() {
     auto now = std::chrono::steady_clock::now();
     auto input_elapsed =
@@ -845,7 +860,8 @@ void AudioService::CheckAndUpdateAudioPowerState() {
         // input task instead of closing the codec from the esp_timer task.
         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_INPUT_STOP_REQUEST);
     }
-    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
+    if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled() &&
+        !external_playback_active_) {
         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
         if (!(codec_->duplex() && codec_->input_enabled())) {
             codec_->EnableOutput(false);

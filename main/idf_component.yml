@@ -1,5 +1,7 @@
 ## IDF Component Manager Manifest File
 dependencies:
+  # Used by the esp32-s3-rlcd-4.2 weather manager to inflate gzip HTTP responses.
+  espressif/zlib: "^1.2.13"
   espressif/ip101:
     version: ^1.1.0
     rules:
