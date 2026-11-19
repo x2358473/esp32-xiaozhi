@@ -85,7 +85,7 @@ void CustomLcdDisplay::SetupPomodoroUI() {
 
     // 右上角状态栏胶囊
     lv_obj_t *status_bar = lv_obj_create(page);
-    lv_obj_set_size(status_bar, 180, 28);
+    lv_obj_set_size(status_bar, 200, 28);
     // 白底上不需要白色胶囊底
     lv_obj_set_style_bg_opa(status_bar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(status_bar, 0, 0);
@@ -97,6 +97,14 @@ void CustomLcdDisplay::SetupPomodoroUI() {
     lv_obj_remove_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_flex_flow(status_bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(status_bar, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // AEC（语音打断）状态徽标：常驻在状态栏最左侧
+    pomo_aec_badge_label_ = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(pomo_aec_badge_label_, font_sm, 0);
+    lv_obj_set_style_text_color(pomo_aec_badge_label_, lv_color_black(), 0);
+    lv_obj_set_style_pad_left(pomo_aec_badge_label_, 0, 0);
+    lv_obj_set_style_pad_right(pomo_aec_badge_label_, 6, 0);  // 与右侧 WiFi 图标拉开距离
+    lv_label_set_text(pomo_aec_badge_label_, "AEC开");
 
     pomo_wifi_icon_img_ = lv_image_create(status_bar);
     lv_image_set_src(pomo_wifi_icon_img_, &ui_img_wifi_off);

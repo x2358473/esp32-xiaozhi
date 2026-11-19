@@ -5,6 +5,7 @@
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
+#include <esp_pm.h>
 #include <string>
 #include <soc/rtc.h>
 #include "custom_lcd_display.h"
@@ -110,6 +111,7 @@ private:
         // BOOT 按钮（GPIO0）- 主要交互按键
         boot_button_.OnClick([this]() {
             if (display_) display_->NotifyUserActivity();  // 记录用户活动
+            WakeToNormalTier();                            // 有按键即回到 L0
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
@@ -118,9 +120,22 @@ private:
             app.ToggleChatState();
         });
 
+        // BOOT 双击：切换设备端 AEC（语音打断模式），仅在空闲时生效（与上游 esp-box 一致）
+        boot_button_.OnDoubleClick([this]() {
+            if (display_) display_->NotifyUserActivity();
+            WakeToNormalTier();
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                ESP_LOGI(TAG, "对话进行中，忽略 AEC 切换");
+                return;
+            }
+            ApplyAecMode(app.GetAecMode() == kAecOff, true);
+        });
+
         // USER 按钮（GPIO18）- 辅助功能按键
         user_button_.OnClick([this]() {
             if (display_) display_->NotifyUserActivity();  // 记录用户活动
+            WakeToNormalTier();                            // 有按键即回到 L0
             if (display_) {
                 display_->CycleDisplayMode();
             }
@@ -129,15 +144,195 @@ private:
 
         user_button_.OnDoubleClick([this]() {
             if (display_) display_->NotifyUserActivity();  // 记录用户活动
+            WakeToNormalTier();                            // 有按键即回到 L0
             // 双击：刷新所有数据（天气、传感器、时间）
             RefreshAllData();
         });
 
         user_button_.OnLongPress([this]() {
             if (display_) display_->NotifyUserActivity();  // 记录用户活动
+            WakeToNormalTier();                            // 有按键即回到 L0
             // 长按：显示系统信息
             ShowSystemInfo();
         });
+    }
+
+    // ===== 分级省电状态机 =====
+    // 交互（按键/对话/唤醒词）→ L0；静置 3 分钟 → L1；静置 15 分钟 → L2。
+    // 三档都保留 AFE 唤醒词（随时可以喊“小智”），只调 CPU 上限、AEC 与 WiFi 唤醒周期：
+    //   L0 240MHz + AEC 开 + 正常 WiFi 唤醒周期
+    //   L1 160MHz + AEC 关（省下 AEC 的算力与功耗）
+    //   L2  80MHz + AEC 关 + WiFi 唤醒周期拉长（listen_interval 10 ≈ 1 秒才醒一次）
+    enum class PowerTier { kNormal = 0, kLight = 1, kDeep = 2 };
+    static constexpr uint32_t kLightIdleMs = 3 * 60 * 1000;   // 3 分钟无活动 → L1
+    static constexpr uint32_t kDeepIdleMs = 15 * 60 * 1000;   // 15 分钟无活动 → L2
+    static constexpr int kNormalMaxMhz = 240;
+    static constexpr int kNormalMinMhz = 160;
+    static constexpr int kLightMaxMhz = 160;
+    static constexpr int kLightMinMhz = 160;
+    static constexpr int kDeepMaxMhz = 80;
+    static constexpr int kDeepMinMhz = 80;
+    static constexpr int kDeepWifiListenInterval = 10;        // 单位 100ms
+    PowerTier power_tier_ = PowerTier::kNormal;
+    AecMode saved_aec_mode_ = kAecOff;   // 用户选择的 AEC 模式（省电档退出时按它恢复）
+    bool aec_overridden_ = false;        // 本次省电档是否由板级主动关掉了 AEC
+    int saved_listen_interval_ = -1;
+
+    static const char* TierName(PowerTier tier) {
+        switch (tier) {
+            case PowerTier::kNormal: return "L0";
+            case PowerTier::kLight:  return "L1";
+            case PowerTier::kDeep:   return "L2";
+        }
+        return "?";
+    }
+
+    static void PowerTierTaskEntry(void* arg) {
+        static_cast<CustomBoard*>(arg)->PowerTierTask();
+    }
+
+    void SetCpuFreqLimit(int max_mhz, int min_mhz) {
+#if CONFIG_PM_ENABLE
+        esp_pm_config_t pm_config = {};
+        pm_config.max_freq_mhz = max_mhz;
+        pm_config.min_freq_mhz = min_mhz;
+        pm_config.light_sleep_enable = false;  // 只做调频：不进 light sleep，避免打断 I2S/AFE 取帧
+        esp_err_t err = esp_pm_configure(&pm_config);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_pm_configure(%d/%d MHz) 失败: %s", max_mhz, min_mhz, esp_err_to_name(err));
+        }
+#else
+        ESP_LOGW(TAG, "CONFIG_PM_ENABLE 未开启，无法把 CPU 限制到 %d MHz", max_mhz);
+#endif
+    }
+
+    void SetWifiListenInterval(int interval) {
+        wifi_config_t wifi_config = {};
+        if (esp_wifi_get_config(WIFI_IF_STA, &wifi_config) != ESP_OK) {
+            return;  // WiFi 还没起（配网模式/未连接），等下次轮询再调
+        }
+        if (saved_listen_interval_ < 0) {
+            saved_listen_interval_ = (int)wifi_config.sta.listen_interval;
+        }
+        if ((int)wifi_config.sta.listen_interval == interval) {
+            return;
+        }
+        wifi_config.sta.listen_interval = (uint16_t)interval;
+        esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "设置 WiFi listen_interval=%d 失败: %s", interval, esp_err_to_name(err));
+        }
+    }
+
+    // 用户主动切换 AEC（BOOT 双击 / MCP），并持久化到 NVS
+    void ApplyAecMode(bool enable_device_aec, bool persist) {
+        auto& app = Application::GetInstance();
+        const AecMode mode = enable_device_aec ? kAecOnDeviceSide : kAecOff;
+        app.SetAecMode(mode);
+        saved_aec_mode_ = mode;   // 以此为“用户选择”，省电档退出时按它恢复
+        aec_overridden_ = false;
+        if (persist) {
+            Settings settings("audio", true);
+            settings.SetInt("aec_mode", enable_device_aec ? 1 : 0);
+        }
+        ESP_LOGI(TAG, "AEC -> %s (device-side)%s", enable_device_aec ? "开" : "关", persist ? "，已保存" : "");
+        RefreshAecBadge();
+    }
+
+    // 开机时从 NVS 恢复用户上次选择的 AEC 模式
+    void LoadAecSetting() {
+        Settings settings("audio", false);
+        const int stored = settings.GetInt("aec_mode", -1);
+        if (stored >= 0) {
+            saved_aec_mode_ = (stored != 0) ? kAecOnDeviceSide : kAecOff;
+            Application::GetInstance().SetAecMode(saved_aec_mode_);
+            ESP_LOGI(TAG, "从 NVS 恢复 AEC 设置: %s", (stored != 0) ? "开" : "关");
+        } else {
+            saved_aec_mode_ = Application::GetInstance().GetAecMode();
+        }
+        RefreshAecBadge();
+    }
+
+    // 把当前真实 AEC 状态刷新到三个页面的常驻徽标上
+    void RefreshAecBadge() {
+        if (display_ != nullptr) {
+            display_->UpdateAecBadge(Application::GetInstance().GetAecMode() != kAecOff);
+        }
+    }
+
+    void SetAecForPowerSave(bool enable_save) {
+        auto& app = Application::GetInstance();
+        if (enable_save) {
+            // 只在第一次进入省电档时记录用户原选择，L1→L2 不能再次覆盖
+            if (!aec_overridden_) {
+                saved_aec_mode_ = app.GetAecMode();
+                aec_overridden_ = true;
+            }
+            if (saved_aec_mode_ != kAecOff && app.GetAecMode() != kAecOff) {
+                app.SetAecMode(kAecOff);  // 省电档关设备端 AEC
+            }
+        } else if (aec_overridden_) {
+            aec_overridden_ = false;
+            app.SetAecMode(saved_aec_mode_);  // 恢复用户原来选择的 AEC 模式
+        }
+        RefreshAecBadge();  // 省电档关掉的 AEC 也要如实显示，避免徽标与实际不一致
+    }
+
+    void ApplyPowerTier(PowerTier tier) {
+        if (tier == power_tier_) {
+            return;
+        }
+        const PowerTier previous = power_tier_;
+        power_tier_ = tier;
+        switch (tier) {
+            case PowerTier::kNormal:
+                SetCpuFreqLimit(kNormalMaxMhz, kNormalMinMhz);
+                SetAecForPowerSave(false);
+                if (saved_listen_interval_ > 0) {
+                    SetWifiListenInterval(saved_listen_interval_);
+                }
+                break;
+            case PowerTier::kLight:
+                SetCpuFreqLimit(kLightMaxMhz, kLightMinMhz);
+                SetAecForPowerSave(true);
+                break;
+            case PowerTier::kDeep:
+                SetCpuFreqLimit(kDeepMaxMhz, kDeepMinMhz);
+                SetAecForPowerSave(true);
+                SetWifiListenInterval(kDeepWifiListenInterval);
+                break;
+        }
+        const int cpu_mhz = (tier == PowerTier::kNormal) ? kNormalMaxMhz
+                          : (tier == PowerTier::kLight) ? kLightMaxMhz : kDeepMaxMhz;
+        ESP_LOGI(TAG, "PWR %s -> %s (cpu<=%dMHz aec=%s)", TierName(previous), TierName(tier), cpu_mhz,
+                 (Application::GetInstance().GetAecMode() != kAecOff) ? "on" : "off");
+    }
+
+    // 用户交互（按键/开始对话）时立刻回 L0，不用等下一轮 5 秒轮询
+    void WakeToNormalTier() {
+        ApplyPowerTier(PowerTier::kNormal);
+    }
+
+    void PowerTierTask() {
+        while (true) {
+            const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            const DeviceState state = Application::GetInstance().GetDeviceState();
+            uint32_t idle_ms = 0;
+            const uint32_t last_activity_ms = display_ ? display_->GetLastActivityMs() : 0;
+            if (display_ && last_activity_ms > 0 && now_ms >= last_activity_ms) {
+                idle_ms = now_ms - last_activity_ms;
+            }
+            // 对话/配网/升级中一律按“正在使用”处理，避免对话中途降频
+            const bool busy = (state != kDeviceStateIdle);
+            PowerTier target = PowerTier::kNormal;
+            if (!busy && idle_ms > kDeepIdleMs) {
+                target = PowerTier::kDeep;
+            } else if (!busy && idle_ms > kLightIdleMs) {
+                target = PowerTier::kLight;
+            }
+            ApplyPowerTier(target);
+            vTaskDelay(pdMS_TO_TICKS(5000));
+        }
     }
 
     // USER 按钮功能实现
@@ -269,6 +464,19 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         
+        // ===== AEC（语音打断模式）开关 =====
+        mcp_server.AddTool("self.system.set_aec",
+            "Enable or disable device-side AEC (voice interruption mode).\n"
+            "Enabled: user can interrupt while the device is speaking. Disabled: saves power, no barge-in.\n"
+            "Use when user says: '打开打断', '关闭打断', '开回声消除', '关回声消除', 'enable barge-in'",
+            PropertyList({
+                Property("enable", kPropertyTypeBoolean)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                ApplyAecMode(properties["enable"].value<bool>(), true);
+                return true;
+            });
+
         // ===== 系统信息工具 =====
         mcp_server.AddTool("self.system.info",
             "Get device system information (CPU, memory, battery, WiFi status).\n"
@@ -848,8 +1056,13 @@ public:
         InitializeSensors();  // 在 I2C 初始化后立即初始化传感器
         InitializeSdcard();   // SD 卡初始化（白噪音播放需要）
         InitializeButtons();     
+        LoadAecSetting();     // 恢复用户上次选择的 AEC（BOOT 双击或 MCP 切换后记住）
         InitializeTools();
         InitializeLcdDisplay();
+        RefreshAecBadge();  // 页面建好后再把 NVS 里的 AEC 选择画到徽标上
+        // 分级省电：启动即按 L0 配置一次 PM，之后由 pwr_tier 任务按静置时长升降档
+        SetCpuFreqLimit(kNormalMaxMhz, kNormalMinMhz);
+        xTaskCreatePinnedToCore(PowerTierTaskEntry, "pwr_tier", 4096, this, 2, nullptr, 1);
     }
 
     virtual AudioCodec* GetAudioCodec() override {

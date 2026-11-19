@@ -459,6 +459,29 @@ void CustomLcdDisplay::SetStatus(const char* status) {
     ESP_LOGD(TAG, "忽略基类状态文字: %s", status ? status : "(null)");
 }
 
+// ===== 重写通知：AEC 开关状态改由常驻徽标显示 =====
+
+void CustomLcdDisplay::ShowNotification(const char* notification, int duration_ms) {
+    // 基类实现会把文字写进 notification_label_，该标签默认停在屏幕 (0,0)，
+    // 正好压住左上角的温湿度文字。AEC 开关的通知（RTC_MODE_ON / RTC_MODE_OFF，
+    // 各语言文案都以 "AEC" 开头）改为只刷新状态栏里的常驻徽标。
+    if (notification != nullptr && std::strncmp(notification, "AEC", 3) == 0) {
+        ESP_LOGD(TAG, "AEC 状态通知改由徽标显示: %s", notification);
+        return;
+    }
+    LcdDisplay::ShowNotification(notification, duration_ms);
+}
+
+void CustomLcdDisplay::UpdateAecBadge(bool aec_enabled) {
+    const char* text = aec_enabled ? "AEC开" : "AEC关";
+    DisplayLockGuard lock(this);
+    for (lv_obj_t* label : {aec_badge_label_, music_aec_badge_label_, pomo_aec_badge_label_}) {
+        if (label != nullptr) {
+            lv_label_set_text(label, text);
+        }
+    }
+}
+
 // ===== 重写状态栏更新（禁用基类的 Font Awesome 文字更新）=====
 
 void CustomLcdDisplay::UpdateStatusBar(bool update_all) {

@@ -59,7 +59,7 @@ void CustomLcdDisplay::SetupWeatherUI() {
 
     // ===== 状态栏（右上角，白底上直接排图标与电量）=====
     lv_obj_t *status_bar = lv_obj_create(screen);
-    lv_obj_set_size(status_bar, 180, 28);
+    lv_obj_set_size(status_bar, 200, 28);
     // 白底上不需要白色胶囊底，直接透明对齐到右上
     lv_obj_set_style_bg_opa(status_bar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(status_bar, 0, 0);
@@ -72,6 +72,14 @@ void CustomLcdDisplay::SetupWeatherUI() {
     lv_obj_set_flex_flow(status_bar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(status_bar, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(status_bar, 5, 0);
+
+    // AEC（语音打断）状态徽标：常驻在状态栏最左侧，翻页不丢状态
+    aec_badge_label_ = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(aec_badge_label_, font_small, 0);
+    lv_obj_set_style_text_color(aec_badge_label_, lv_color_black(), 0);
+    lv_obj_set_style_pad_left(aec_badge_label_, 0, 0);
+    lv_obj_set_style_pad_right(aec_badge_label_, 6, 0);  // 与右侧 WiFi 图标拉开距离
+    lv_label_set_text(aec_badge_label_, "AEC开");
 
     // WiFi 图标（我们自己的图片图标，不给基类用）
     wifi_icon_img_ = lv_image_create(status_bar);
@@ -320,6 +328,12 @@ void CustomLcdDisplay::SetupWeatherUI() {
 
     notification_label_ = lv_label_create(screen);
     lv_label_set_text(notification_label_, "");
+    // 放在顶部空白带（温湿度右边、状态栏左边），避免默认 (0,0) 压住温湿度
+    lv_obj_set_style_text_font(notification_label_, font_small, 0);
+    lv_obj_set_style_text_color(notification_label_, lv_color_black(), 0);
+    lv_obj_set_width(notification_label_, 84);
+    lv_label_set_long_mode(notification_label_, LV_LABEL_LONG_DOT);
+    lv_obj_align(notification_label_, LV_ALIGN_TOP_LEFT, 104, 8);
     lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
     
     mute_label_ = lv_label_create(screen);

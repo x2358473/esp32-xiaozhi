@@ -99,6 +99,11 @@ private:
     lv_obj_t *music_battery_icon_img_ = nullptr;  // 音乐页面状态栏电池图标
     lv_obj_t *music_battery_pct_label_ = nullptr; // 音乐页面状态栏电量文字
 
+    // AEC（语音打断）状态徽标：三个页面状态栏最左侧各一个，常驻显示开/关
+    lv_obj_t *aec_badge_label_ = nullptr;        // 天气页
+    lv_obj_t *music_aec_badge_label_ = nullptr;  // 音乐页
+    lv_obj_t *pomo_aec_badge_label_ = nullptr;   // 番茄钟页
+
     // 数据更新任务句柄
     TaskHandle_t update_task_handle_ = nullptr;
     
@@ -157,6 +162,8 @@ public:
     // 省电模式：记录用户活动，唤醒省电模式
     void NotifyUserActivity();
     bool IsPowerSaving() const { return power_saving_; }
+    // 供板级省电状态机读取“上次活动时间”（tick 毫秒）
+    uint32_t GetLastActivityMs() const { return last_activity_ms_; }
     
     // 重写小智的 AI 显示方法，适配到左下角卡片
     virtual void SetChatMessage(const char* role, const char* content) override;
@@ -179,6 +186,11 @@ public:
     // 基类 SetStatus() 会把 "Standby"/"Initializing" 之类的文字画到顶部状态栏上，
     // 本类没有该区域，直接忽略。
     virtual void SetStatus(const char* status) override;
+    // 基类 ShowNotification() 把文字写进左上角的 notification_label_，会与温湿度重叠；
+    // AEC 开关状态改为常驻徽标显示，这类通知直接吞掉。
+    virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
+    // 更新三个页面的 AEC 徽标（true = 设备端 AEC 开启/可打断）
+    void UpdateAecBadge(bool aec_enabled);
     virtual void SetMusicInfo(const char* title, const char* artist) override;
     virtual void SetMusicLyric(const char* lyric) override;
     virtual void SetMusicProgress(uint32_t current_ms, uint32_t total_ms) override;

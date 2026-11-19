@@ -10,7 +10,8 @@
                 "CONFIG_USE_DEVICE_AEC=y",
                 "CONFIG_LOG_DEFAULT_LEVEL_WARN=y",
                 "CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=n",
-                "CONFIG_LOG_MAXIMUM_LEVEL_INFO=y"
+                "CONFIG_LOG_MAXIMUM_LEVEL_INFO=y",
+                "CONFIG_PM_ENABLE=y"
             ]
         }
     ]
