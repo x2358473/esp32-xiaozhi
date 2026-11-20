@@ -25,10 +25,14 @@ typedef struct {
 // 
 // 负责底层 SPI 通信、像素映射、屏幕初始化等硬件操作。
 // 这个类不涉及任何 UI 逻辑，只提供像素级别的绘制能力。
+//
+// 同一款 ST7305 400x300 1bpp 屏被多块板卡使用（waveshare/esp32-s3-rlcd-4.2、
+// luobo/esp32-s3-nano-rlcd），差别只有引脚与 SPI 时钟，故放在 boards/common。
 class RlcdDriver {
 public:
     RlcdDriver(spi_display_config_t spiconfig, int width, int height, 
-               spi_host_device_t spi_host = SPI3_HOST);
+               spi_host_device_t spi_host = SPI3_HOST,
+               int pclk_hz = 40 * 1000 * 1000);
     ~RlcdDriver();
 
     // 屏幕初始化（发送初始化命令序列）

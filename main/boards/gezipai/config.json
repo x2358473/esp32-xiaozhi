@@ -1,0 +1,20 @@
+{
+    "type": "gezipai",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "gezipai",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_OTA_URL=\"http://192.168.22.153:8002/xiaozhi/ota/\""
+            ]
+        },
+        {
+            "name": "gezipai-public",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_OTA_URL=\"https://xiaozhi.luobonas.cn:18002/xiaozhi/ota/\""
+            ]
+        }
+    ]
+}

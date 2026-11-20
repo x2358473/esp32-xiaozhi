@@ -10,7 +10,8 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
                              gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout,
                              gpio_num_t din, gpio_num_t pa_pin, uint8_t es8311_addr,
                              uint8_t es7210_addr, bool input_reference, float input_gain,
-                             int reference_gain_channel, float reference_gain, float pa_voltage) {
+                             int reference_gain_channel, float reference_gain, float pa_voltage,
+                             int i2c_clock_speed_hz) {
     duplex_ = true;                              // 是否双工
     input_reference_ = input_reference;          // 是否使用参考输入，实现回声消除
     input_channels_ = input_reference_ ? 2 : 1;  // 输入通道数
@@ -36,9 +37,23 @@ BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int
         .port = (i2c_port_t)1,
         .addr = es8311_addr,
         .bus_handle = i2c_master_handle,
+        // 0 表示沿用组件默认（100kHz）。个别板卡（I2C 上有电平转换）必须 400kHz，
+        // 否则写寄存器会中途失败、codec 回退 dummy。输入侧复用同一份 i2c_cfg。
+        .clock_speed_hz = i2c_clock_speed_hz,
     };
     out_ctrl_if_ = audio_codec_new_i2c_ctrl(&i2c_cfg);
     assert(out_ctrl_if_ != NULL);
+
+    if (i2c_clock_speed_hz != 0) {
+        // 诊断：绕过 codec 驱动，直接用组件自己的 ctrl_if 读写一次寄存器。
+        // 用于区分故障在 ctrl_if 层（总线/速率/地址）还是 codec 驱动层。
+        uint8_t probe = 0;
+        int rret = out_ctrl_if_->read_reg(out_ctrl_if_, 0x00, 1, &probe, 1);
+        ESP_LOGI(TAG, "ctrl_if.read_reg(0x00) ret=%d val=0x%02X", rret, probe);
+        uint8_t back[1] = {probe};
+        int wret = out_ctrl_if_->write_reg(out_ctrl_if_, 0x00, 1, back, 1);
+        ESP_LOGI(TAG, "ctrl_if.write_reg(0x00,0x%02X) ret=%d", probe, wret);
+    }
 
     gpio_if_ = audio_codec_new_gpio();
     assert(gpio_if_ != NULL);
@@ -102,7 +117,10 @@ void BoxAudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gpio_
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
         .dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM,
-        .dma_frame_num = AUDIO_CODEC_DMA_FRAME_NUM,
+        // 缓冲时长按采样率保持不变（基准 16k / 240 帧 ≈ 90ms）。
+        // 否则 24k 板卡缓冲时长会掉到 60ms，TTS 播放容易欠载破音。
+        .dma_frame_num = static_cast<uint32_t>(AUDIO_CODEC_DMA_FRAME_NUM) *
+                         output_sample_rate_ / 16000,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
         .intr_priority = 0,

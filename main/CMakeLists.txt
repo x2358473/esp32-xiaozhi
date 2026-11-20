@@ -693,6 +693,10 @@ elseif(CONFIG_BOARD_TYPE_LILYGO_T_DISPLAY_S3_PRO_MVSRLORA_NO_BATTERY)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+elseif(CONFIG_BOARD_TYPE_LUOBO_ESP32_S3_NANO_RLCD)
+    set(BOARD_DIR "luobo/esp32-s3-nano-rlcd")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
 elseif(CONFIG_BOARD_TYPE_MOVECALL_MOJI_ESP32S3)
     set(BOARD_DIR "movecall/moji-esp32s3")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -817,6 +821,8 @@ elseif(CONFIG_BOARD_TYPE_GENJUTECH_S3_1_54TFT)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+elseif(CONFIG_BOARD_TYPE_GEZIPAI)
+    set(BOARD_DIR "gezipai")
 elseif(CONFIG_BOARD_TYPE_GUITION_JC4827W543)
     set(BOARD_DIR "guition/jc4827w543")
     # 16px, not the 20px most 480-wide boards use: the assets partition is 1MB
@@ -1179,6 +1185,15 @@ if(CONFIG_IDF_TARGET_ESP32S3)
     list(APPEND SOURCES "boards/common/esp32_camera.cc")
 endif()
 
+# The RLCD boards (ST7305 400x300 1-bit reflective LCD) share one SPI pixel
+# driver and the LVGL display layer built on top of it.
+if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2 OR CONFIG_BOARD_TYPE_LUOBO_ESP32_S3_NANO_RLCD)
+    list(APPEND SOURCES
+        "boards/common/rlcd_driver.cc"
+        "boards/common/rlcd_display.cc"
+    )
+endif()
+
 set(MAIN_PRIV_REQUIRES_EXTRA "")
 # The esp32-s3-rlcd-4.2 board keeps its own managers (weather, pomodoro, SD card,
 # lunar calendar) that talk HTTP, JSON, LVGL-on-LCD and SD/MMC directly.
@@ -1189,6 +1204,12 @@ if(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2)
         esp_lcd
         sdmmc
         esp_driver_sdmmc
+    )
+endif()
+if(CONFIG_BOARD_TYPE_LUOBO_ESP32_S3_NANO_RLCD)
+    # Drives the same ST7305 panel through esp_lcd SPI panel IO (see boards/common).
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        esp_lcd
     )
 endif()
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET AND CONFIG_XIAOZHI_ETH_PHY_IP101)

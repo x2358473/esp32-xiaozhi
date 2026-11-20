@@ -12,7 +12,7 @@ static const char *TAG = "RlcdDriver";
 // ===== 构造 / 析构 =====
 
 RlcdDriver::RlcdDriver(spi_display_config_t spiconfig, int width, int height,
-                        spi_host_device_t spi_host)
+                        spi_host_device_t spi_host, int pclk_hz)
     : mosi_(spiconfig.mosi), scl_(spiconfig.scl),
       dc_(spiconfig.dc), cs_(spiconfig.cs), rst_(spiconfig.rst),
       width_(width), height_(height)
@@ -33,7 +33,7 @@ RlcdDriver::RlcdDriver(spi_display_config_t spiconfig, int width, int height,
     esp_lcd_panel_io_spi_config_t io_config = {};
     io_config.dc_gpio_num = static_cast<gpio_num_t>(dc_);
     io_config.cs_gpio_num = static_cast<gpio_num_t>(cs_);
-    io_config.pclk_hz = 40 * 1000 * 1000;
+    io_config.pclk_hz = pclk_hz;
     io_config.lcd_cmd_bits = 8;
     io_config.lcd_param_bits = 8;
     io_config.spi_mode = 0;
