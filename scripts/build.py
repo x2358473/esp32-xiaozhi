@@ -1837,6 +1837,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         idf_version = _detect_idf_version_for_listing()
         variants = _collect_variants(config_filename=args.config, idf_version=idf_version)
         selected = _select_variants_for_changes(variants, sys.stdin.read().splitlines())
+        board_filter = os.environ.get("XIAOZHI_BOARD_FILTER", "").strip()
+        if board_filter:
+            # Keep only the requested board. Filter the full variant list rather than
+            # `selected`: shared files (workflows/scripts) select one representative
+            # variant per group, which may not be this board and would empty the matrix.
+            selected = [v for v in variants if v.get("board") == board_filter]
         print(json.dumps(selected))
         return
 

@@ -2,7 +2,13 @@ name: Build Boards
 
 on:
   # Manual runs exercise the full matrix, including CI-specific options.
+  # Set `board` to compile a single board directory instead (e.g. gezipai).
   workflow_dispatch:
+    inputs:
+      board:
+        description: 'Board directory to build (e.g. waveshare/esp32-s3-rlcd-4.2); empty or "all" for the full matrix'
+        required: false
+        default: 'waveshare/esp32-s3-rlcd-4.2'
   push:
     branches:
       - main
@@ -37,9 +43,18 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
+          INPUT_BOARD: ${{ inputs.board }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           CHANGED_FILE="$RUNNER_TEMP/changed-files.txt"
+          # Manual runs may narrow the matrix to one board directory; the filtering
+          # itself lives in build.py (XIAOZHI_BOARD_FILTER) so the changed-file list
+          # keeps upstream semantics.
+          BOARD_FILTER="${INPUT_BOARD:-}"
+          if [[ "$BOARD_FILTER" == "all" ]]; then
+            BOARD_FILTER=""
+          fi
+          export XIAOZHI_BOARD_FILTER="$BOARD_FILTER"
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             git ls-files > "$CHANGED_FILE"
           elif [[ "$EVENT_NAME" == "pull_request" ]]; then
@@ -97,9 +112,97 @@ jobs:
           fi
           python scripts/build.py "$BOARD" --name "$VARIANT" "${OPTIONS[@]}"
 
+      - name: Rename firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="${{ matrix.ci_name || matrix.full_name }}"
+          SHA7="${GITHUB_SHA::7}"
+          cp build/merged-binary.bin "xiaozhi_${NAME}_${SHA7}.bin"
+
+          # assets 分区单独烧录，缺少会导致模型加载后 AFE 初始化崩溃
+          ASSETS_BIN=""
+          for candidate in build/configured_assets.bin build/generated_assets.bin; do
+            if [ -f "$candidate" ]; then
+              ASSETS_BIN="$candidate"
+              break
+            fi
+          done
+          if [ -n "$ASSETS_BIN" ]; then
+            cp "$ASSETS_BIN" "xiaozhi_${NAME}_${SHA7}_assets.bin"
+            # 偏移取自 flash_args，随分区表变化自动跟随（V1/V2 分区表不同）
+            ASSETS_OFFSET="$(awk -v b="$(basename "$ASSETS_BIN")" \
+              '$2 == b || $2 ~ (b "$") {print $1; exit}' build/flash_args)"
+            if [ -z "$ASSETS_OFFSET" ]; then
+              ASSETS_OFFSET="0x800000"
+            fi
+            # merged-binary 已延伸到 assets 起始地址之后，无法再用 merge-bin（会报 overlap），
+            # 这里按偏移覆盖生成单文件完整镜像，供网页刷机使用。
+            python scripts/make_full_image.py \
+              build/merged-binary.bin \
+              "$ASSETS_BIN" \
+              "xiaozhi_${NAME}_${SHA7}_full.bin" \
+              --offset "$ASSETS_OFFSET"
+          else
+            echo "::warning::no assets partition image found, assets partition will not be included"
+          fi
+          ls -l xiaozhi_*.bin
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: xiaozhi_${{ matrix.ci_name || matrix.full_name }}_${{ github.sha }}
-          path: build/merged-binary.bin
+          path: |
+            xiaozhi_*.bin
+            build/xiaozhi.elf
+            build/xiaozhi.map
           if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.variants != '[]' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set release tag
+        id: tag
+        run: echo "tag=v2.6.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: dist/*.bin
+          overwrite_files: true
+          body: |
+            自动构建产物（xiaozhi 2.6.0 基线）
+
+            - Commit: `${{ github.sha }}`
+            - Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            每个板卡变体三个文件：
+
+            - `xiaozhi_<board>_<sha>_full.bin` —— **完整镜像**（0x0 起，已含 assets 分区），ESP Web Tools / 网页刷机用这个
+            - `xiaozhi_<board>_<sha>.bin` —— 仅 app（bootloader + 分区表 + 应用）
+            - `xiaozhi_<board>_<sha>_assets.bin` —— assets 分区（偏移见分区表，通常 0x800000），与 app 配套
+
+            命令行烧录（app + assets 分开写）：
+
+            ```
+            esptool.py --chip esp32s3 -p <COM> -b 460800 write_flash \
+              0x0       xiaozhi_<board>_<sha>.bin \
+              0x800000  xiaozhi_<board>_<sha>_assets.bin
+            ```
+
+            Web 工具烧录：直接选 `_full.bin`（体积较大，写入会慢一些）。
+
+            从旧版本升级建议先 `esptool.py erase_flash`，否则 assets 分区残留会与新固件不匹配。
