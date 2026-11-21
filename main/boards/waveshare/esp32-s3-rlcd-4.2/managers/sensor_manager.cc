@@ -1,6 +1,8 @@
 #include "sensor_manager.h"
-#if __has_include("../secret_config.h")
-#include "../secret_config.h"
+// 板卡目录本身在 INCLUDE_DIRS 里（main/CMakeLists.txt），因此不带 ../，
+// 与 data_update_task.cc 的写法保持一致，也避开静态检查对 ../ 相对包含的误报。
+#if __has_include("secret_config.h")
+#include "secret_config.h"
 #endif
 
 // secret_config.h 被 .gitignore 忽略，缺失时用默认值兜底
