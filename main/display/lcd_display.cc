@@ -1059,9 +1059,10 @@ void LcdDisplay::SetupUI() {
 #if CONFIG_DISPLAY_COMPACT_CHAT_BAND
     // Cap the text band so long replies scroll inside it instead of growing
     // upward over the emotion icon and the status bar. The cap is a whole
-    // number of text lines so an overflowing message never shows a half line.
+    // number of text lines plus the vertical padding on both sides, so an
+    // overflowing message never shows a half line.
     lv_obj_set_style_max_height(bottom_bar_,
-                                text_font->line_height * 4 + lvgl_theme->spacing(4), 0);
+                                text_font->line_height * 5 + lvgl_theme->spacing(4) * 2, 0);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(bottom_bar_, LV_DIR_VER);
     // Top-align the label so the scroll area has a well defined origin.
