@@ -990,6 +990,17 @@ config USE_MULTILINE_CHAT_MESSAGE
         When disabled (default), a single-line horizontally scrolling label
         is shown at the bottom of the screen.
 
+config DISPLAY_COMPACT_CHAT_BAND
+    bool "Compact chat band: top-aligned emotion icon and a capped text area"
+    depends on USE_MULTILINE_CHAT_MESSAGE
+    default n
+    help
+        Intended for small square panels (for example 240x240). The emotion icon
+        is moved from the center of the screen to a narrow band right below the
+        status bar, and the chat message area is capped to the lower part of the
+        screen. Longer replies scroll inside that band instead of growing upward
+        over the emotion icon and the status bar.
+
 choice WAKE_WORD_TYPE
     prompt "Wake Word Implementation Type"
     default WAKE_WORD_DISABLED

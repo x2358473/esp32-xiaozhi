@@ -937,6 +937,11 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_pad_all(emoji_box_, 0, 0);
     lv_obj_set_style_border_width(emoji_box_, 0, 0);
     lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
+#if CONFIG_DISPLAY_COMPACT_CHAT_BAND
+    // Small screens: park the emotion icon right below the status bar so the
+    // chat text band at the bottom never covers it.
+    lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, lvgl_theme->spacing(8));
+#endif
 
     emoji_label_ = lv_label_create(emoji_box_);
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
@@ -1049,6 +1054,15 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_align(chat_message_label_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(chat_message_label_, lvgl_theme->text_color(), 0);
     lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
+#if CONFIG_DISPLAY_COMPACT_CHAT_BAND
+    // Cap the text band so long replies scroll inside it instead of growing
+    // upward over the emotion icon and the status bar.
+    lv_obj_set_style_max_height(bottom_bar_, height_ * 2 / 5, 0);
+    lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(bottom_bar_, LV_DIR_VER);
+    // Top-align the label so the scroll area has a well defined origin.
+    lv_obj_align(chat_message_label_, LV_ALIGN_TOP_MID, 0, 0);
+#endif
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);  // Hide until there is content
 #else
     /* Top layer: Bottom bar - fixed height at bottom */
@@ -1165,6 +1179,12 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
     if (bottom_bar_ != nullptr) {
         lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
     }
+#if CONFIG_DISPLAY_COMPACT_CHAT_BAND
+    // Keep the newest line visible when the capped band scrolls.
+    if (bottom_bar_ != nullptr) {
+        lv_obj_scroll_to_y(bottom_bar_, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+#endif
 #endif
 }
 
