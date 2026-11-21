@@ -939,8 +939,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(emoji_box_, LV_ALIGN_CENTER, 0, 0);
 #if CONFIG_DISPLAY_COMPACT_CHAT_BAND
     // Small screens: park the emotion icon right below the status bar so the
-    // chat text band at the bottom never covers it.
-    lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0, lvgl_theme->spacing(8));
+    // chat text band at the bottom never covers it. The status bar occupies
+    // one text line plus its vertical padding.
+    lv_obj_align(emoji_box_, LV_ALIGN_TOP_MID, 0,
+                 text_font->line_height + lvgl_theme->spacing(6));
 #endif
 
     emoji_label_ = lv_label_create(emoji_box_);
@@ -1056,8 +1058,10 @@ void LcdDisplay::SetupUI() {
     lv_obj_align(chat_message_label_, LV_ALIGN_CENTER, 0, 0);
 #if CONFIG_DISPLAY_COMPACT_CHAT_BAND
     // Cap the text band so long replies scroll inside it instead of growing
-    // upward over the emotion icon and the status bar.
-    lv_obj_set_style_max_height(bottom_bar_, height_ * 2 / 5, 0);
+    // upward over the emotion icon and the status bar. The cap is a whole
+    // number of text lines so an overflowing message never shows a half line.
+    lv_obj_set_style_max_height(bottom_bar_,
+                                text_font->line_height * 4 + lvgl_theme->spacing(4), 0);
     lv_obj_add_flag(bottom_bar_, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(bottom_bar_, LV_DIR_VER);
     // Top-align the label so the scroll area has a well defined origin.
@@ -1180,9 +1184,14 @@ void LcdDisplay::SetChatMessage(const char* role, const char* content) {
         lv_obj_align(bottom_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
     }
 #if CONFIG_DISPLAY_COMPACT_CHAT_BAND
-    // Keep the newest line visible when the capped band scrolls.
+    // Follow the newest line only when the text really overflows the capped
+    // band; otherwise reset the scroll offset so a short message is never
+    // clipped by a stale offset from a previous long one.
     if (bottom_bar_ != nullptr) {
-        lv_obj_scroll_to_y(bottom_bar_, LV_COORD_MAX, LV_ANIM_OFF);
+        lv_obj_update_layout(bottom_bar_);
+        lv_obj_scroll_to_y(bottom_bar_,
+                           lv_obj_get_scroll_bottom(bottom_bar_) > 0 ? LV_COORD_MAX : 0,
+                           LV_ANIM_OFF);
     }
 #endif
 #endif
