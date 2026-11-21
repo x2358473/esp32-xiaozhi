@@ -1,6 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
+#include "touch_display.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
@@ -57,7 +58,7 @@ private:
     CustomButton volume_up_button_;
     CustomButton volume_down_button_;
     i2c_master_bus_handle_t i2c_bus_;
-    LcdDisplay* display_;
+    TouchLcdDisplay* display_;
     PowerManager* power_manager_ = nullptr;
     PowerSaveTimer* power_save_timer_ = nullptr;
 
@@ -190,9 +191,11 @@ private:
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
         
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new TouchLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY
                                     );
+        display_->SetConfigModeHandler([this]() { EnterWifiConfigMode(); });
+        display_->SetShutdownHandler([this]() { power_manager_->PowerOff(); });
     }
 
     void InitializeButtons() {
