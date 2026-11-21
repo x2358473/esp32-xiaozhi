@@ -10,7 +10,6 @@
 /**
  * SpiLcdDisplay with a touch layer on top of the standard chat UI:
  *   - tap              : start / interrupt the conversation (same as a short PWR press)
- *   - swipe up         : start / interrupt the conversation
  *   - swipe down       : open the settings panel (AEC / volume / brightness / WiFi config / power off)
  *   - swipe left/right : switch between the light and the dark theme
  *
@@ -43,6 +42,8 @@ public:
 private:
     // LVGL event callbacks (static + user_data == this, the LVGL way)
     static void IndevEventCb(lv_event_t* e);
+    static void SliderRowPressCb(lv_event_t* e);
+    static void SliderRowReleasedCb(lv_event_t* e);
     static void VolumeSliderCb(lv_event_t* e);
     static void BrightnessSliderCb(lv_event_t* e);
     static void BrightnessSliderReleasedCb(lv_event_t* e);
@@ -53,6 +54,8 @@ private:
 
     void HandleIndevReleased(const lv_point_t& point);
     bool IsPressOnControl(const lv_point_t& point) const;
+    static void SetSliderFromPoint(lv_obj_t* slider, const lv_point_t& point);
+    static void AttachSliderRow(lv_obj_t* row, lv_obj_t* slider);
     void ToggleTheme();
     void OpenSettingBox();
     void CloseSettingBox();
@@ -62,6 +65,8 @@ private:
 
     lv_obj_t* setting_box_ = nullptr;
     lv_obj_t* button_row_ = nullptr;
+    lv_obj_t* volume_row_ = nullptr;
+    lv_obj_t* brightness_row_ = nullptr;
     lv_obj_t* volume_slider_ = nullptr;
     lv_obj_t* brightness_slider_ = nullptr;
     lv_obj_t* aec_switch_ = nullptr;

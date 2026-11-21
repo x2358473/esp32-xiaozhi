@@ -16,7 +16,10 @@ constexpr int32_t kSwipeMinDistance = 40;
 
 constexpr int32_t kSettingRowHeight = 44;
 constexpr int32_t kSettingPanelPadding = 6;
-constexpr int32_t kSliderWidth = 140;
+constexpr int32_t kSliderWidth = 160;
+constexpr int32_t kSliderHeight = 14;
+constexpr int32_t kKnobSize = 22;
+constexpr int32_t kSliderExtClickArea = 16;
 constexpr int32_t kControlHitMargin = 12;
 
 bool PointInObj(const lv_obj_t* obj, const lv_point_t& point, int32_t margin) {
@@ -137,16 +140,20 @@ void TouchLcdDisplay::HandleIndevReleased(const lv_point_t& point) {
         return;
     }
 
-    if (panel_open) {
-        return;
-    }
-    ESP_LOGI(TAG, "Swipe up, toggle chat");
-    Application::GetInstance().ToggleChatState();
+    // Swipe up is deliberately ignored: a tap already toggles the chat.
 }
 
 bool TouchLcdDisplay::IsPressOnControl(const lv_point_t& point) const {
     if (setting_box_ == nullptr) {
         return false;
+    }
+    // The whole slider row is ours: LVGL only reacts on the knob, so the row is the
+    // surface that turns a press anywhere on the track into a value change.
+    if (PointInObj(volume_row_, point, 0)) {
+        return true;
+    }
+    if (PointInObj(brightness_row_, point, 0)) {
+        return true;
     }
     if (PointInObj(volume_slider_, point, kControlHitMargin)) {
         return true;
@@ -158,6 +165,49 @@ bool TouchLcdDisplay::IsPressOnControl(const lv_point_t& point) const {
         return true;
     }
     return PointInObj(button_row_, point, 0);
+}
+
+void TouchLcdDisplay::SetSliderFromPoint(lv_obj_t* slider, const lv_point_t& point) {
+    if (slider == nullptr) {
+        return;
+    }
+    lv_area_t area;
+    lv_obj_get_coords(slider, &area);
+    int32_t width = area.x2 - area.x1;
+    if (width <= 0) {
+        return;
+    }
+    int32_t minimum = lv_slider_get_min_value(slider);
+    int32_t maximum = lv_slider_get_max_value(slider);
+    int32_t offset = LV_CLAMP(point.x - area.x1, 0, width);
+    int32_t value = minimum + (int32_t)(((int64_t)(maximum - minimum) * offset) / width);
+    if (value == lv_slider_get_value(slider)) {
+        return;
+    }
+    lv_slider_set_value(slider, value, LV_ANIM_OFF);
+    // LVGL only changes the value while the knob itself is dragged, so a press on the
+    // track has to publish the change for the handlers attached to the slider.
+    lv_obj_send_event(slider, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+void TouchLcdDisplay::SliderRowPressCb(lv_event_t* e) {
+    auto slider = static_cast<lv_obj_t*>(lv_event_get_user_data(e));
+    lv_indev_t* indev = lv_indev_active();
+    if (slider == nullptr || indev == nullptr) {
+        return;
+    }
+    lv_point_t point;
+    lv_indev_get_point(indev, &point);
+    SetSliderFromPoint(slider, point);
+}
+
+void TouchLcdDisplay::SliderRowReleasedCb(lv_event_t* e) {
+    auto slider = static_cast<lv_obj_t*>(lv_event_get_user_data(e));
+    if (slider == nullptr) {
+        return;
+    }
+    // Let the slider handlers commit the value (volume writes NVS, brightness persists).
+    lv_obj_send_event(slider, LV_EVENT_RELEASED, nullptr);
 }
 
 void TouchLcdDisplay::ToggleTheme() {
@@ -219,27 +269,31 @@ void TouchLcdDisplay::OpenSettingBox() {
 #endif
 
     {
-        lv_obj_t* row = CreateRow(setting_box_, kSettingRowHeight);
-        lv_obj_t* label = lv_label_create(row);
+        volume_row_ = CreateRow(setting_box_, kSettingRowHeight);
+        lv_obj_t* label = lv_label_create(volume_row_);
         lv_label_set_text(label, "音量");
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
 
         auto codec = Board::GetInstance().GetAudioCodec();
         int volume = (codec != nullptr) ? codec->output_volume() : 70;
 
-        volume_slider_ = lv_slider_create(row);
-        lv_obj_set_size(volume_slider_, kSliderWidth, 10);
+        volume_slider_ = lv_slider_create(volume_row_);
+        lv_obj_set_size(volume_slider_, kSliderWidth, kSliderHeight);
         lv_obj_align(volume_slider_, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_set_style_width(volume_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_height(volume_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_radius(volume_slider_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_slider_set_range(volume_slider_, 0, 100);
         lv_slider_set_value(volume_slider_, volume, LV_ANIM_OFF);
-        lv_obj_set_ext_click_area(volume_slider_, 12);
+        lv_obj_set_ext_click_area(volume_slider_, kSliderExtClickArea);
         // Applied on release only: SetOutputVolume() writes NVS on every call.
         lv_obj_add_event_cb(volume_slider_, VolumeSliderCb, LV_EVENT_RELEASED, this);
+        AttachSliderRow(volume_row_, volume_slider_);
     }
 
     {
-        lv_obj_t* row = CreateRow(setting_box_, kSettingRowHeight);
-        lv_obj_t* label = lv_label_create(row);
+        brightness_row_ = CreateRow(setting_box_, kSettingRowHeight);
+        lv_obj_t* label = lv_label_create(brightness_row_);
         lv_label_set_text(label, "亮度");
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
 
@@ -253,15 +307,19 @@ void TouchLcdDisplay::OpenSettingBox() {
             }
         }
 
-        brightness_slider_ = lv_slider_create(row);
-        lv_obj_set_size(brightness_slider_, kSliderWidth, 10);
+        brightness_slider_ = lv_slider_create(brightness_row_);
+        lv_obj_set_size(brightness_slider_, kSliderWidth, kSliderHeight);
         lv_obj_align(brightness_slider_, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_set_style_width(brightness_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_height(brightness_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_radius(brightness_slider_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_slider_set_range(brightness_slider_, 1, 100);
         lv_slider_set_value(brightness_slider_, brightness, LV_ANIM_OFF);
-        lv_obj_set_ext_click_area(brightness_slider_, 12);
+        lv_obj_set_ext_click_area(brightness_slider_, kSliderExtClickArea);
         lv_obj_add_event_cb(brightness_slider_, BrightnessSliderCb, LV_EVENT_VALUE_CHANGED, this);
         lv_obj_add_event_cb(brightness_slider_, BrightnessSliderReleasedCb, LV_EVENT_RELEASED,
                             this);
+        AttachSliderRow(brightness_row_, brightness_slider_);
     }
 
     {
@@ -286,9 +344,23 @@ void TouchLcdDisplay::CloseSettingBox() {
     lv_obj_delete_async(setting_box_);
     setting_box_ = nullptr;
     button_row_ = nullptr;
+    volume_row_ = nullptr;
+    brightness_row_ = nullptr;
     volume_slider_ = nullptr;
     brightness_slider_ = nullptr;
     aec_switch_ = nullptr;
+}
+
+void TouchLcdDisplay::AttachSliderRow(lv_obj_t* row, lv_obj_t* slider) {
+    if (row == nullptr || slider == nullptr) {
+        return;
+    }
+    // The row is the hit surface: LVGL's slider only reacts on the knob, so pressing
+    // the track would otherwise do nothing at all.
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, SliderRowPressCb, LV_EVENT_PRESSED, slider);
+    lv_obj_add_event_cb(row, SliderRowPressCb, LV_EVENT_PRESSING, slider);
+    lv_obj_add_event_cb(row, SliderRowReleasedCb, LV_EVENT_RELEASED, slider);
 }
 
 lv_obj_t* TouchLcdDisplay::CreateRow(lv_obj_t* parent, int32_t height) {
