@@ -1,7 +1,8 @@
 # 本仓库说明（相对上游的改动）
 
 本仓库 `x2358473/esp32-xiaozhi` 是 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) 的个人 fork，
-基线为上游 **v2.6.0**（合并提交 `428e985`），在它之上维护自己做过的几块板。
+基线是上游官方 **v2.6.0** 提交 `4de00aed`（`upstream/v2.6.0`），本仓库的提交直接接在它之上，
+因此以后可以用 `git merge upstream/main` 跟进上游，不再做整树搬运。
 
 - 上游板卡、协议、音频链路保持原样，所有自研内容都带独立 Kconfig 开关或只落在板卡目录里；
 - 板卡身份（`config.json` 的 `type`、板卡目录名、`BOARD_TYPE_*`）一经发布不再改名，否则服务端会把设备当新机器。
@@ -43,8 +44,22 @@ python scripts/build.py gezipai --name gezipai                    # 或 --name g
   `wn9_nihaoxiaozhi_tts`）；唤醒词不允许写进板卡的 `config.json`；
 - 烧写整片：`esptool --chip esp32s3 write_flash 0x0 <merged.bin>`（换基线时分区表可能变，不要只写 app）。
 
+## 跟进上游
+
+```bash
+git fetch upstream                     # upstream = https://github.com/78/xiaozhi-esp32.git
+git merge upstream/main                # 冲突热点见文末
+```
+
+`upstream` 的 tag 抓到了 `refs/tags/upstream/<版本>` 命名空间下，避免和本地 tag 同名冲突；
+要看官方某个版本用 `git diff upstream/v2.7.0 -- main/`。
+
 ## 仓库历史
 
+- 2026-11-22：把历史重建到官方基线上。原来的 v2.6.0 是整树 squash 的 `428e985`（父提交为另一个
+  fork 的 UI 分支），与官方 `4de00aed` 内容一致但祖先断裂，无法 merge。现在 `main` 直接从
+  `upstream/v2.6.0` 起，12 个自有提交逐个 cherry-pick 上来，内容与旧树零差异（仅文件 mode 随之取官方值）。
+  旧历史保留在分支 `port/v2.6.0`（`4fde6b8`）与 `archive/xqy-2.6.0`（`0f82781`）上。
 - 2026-11：把两个 2.5.2 时代的 fork 合并进本仓库（gezipai 板卡、24 kHz 采样、nano-rlcd 板卡、CI 工具链）。
   旧仓库已打 tag `final-v2.5.2` 归档：
   - `esp32-s3-xiaozhi` → `final-v2.5.2` = `f6d1e3a`
