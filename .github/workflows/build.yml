@@ -13,12 +13,23 @@ on:
     branches:
       - main
       - ci/* # for ci test
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
 
 permissions:
   contents: read
+
+env:
+  # This fork only maintains these boards; push-triggered runs build them instead of the
+  # upstream representative set (comma-separated board directories, see scripts/build.py).
+  MAINTAINED_BOARDS: waveshare/esp32-s3-rlcd-4.2,waveshare/esp32-s3-touch-lcd-1.54,luobo/esp32-s3-nano-rlcd,gezipai
 
 jobs:
   prepare:
@@ -53,6 +64,11 @@ jobs:
           BOARD_FILTER="${INPUT_BOARD:-}"
           if [[ "$BOARD_FILTER" == "all" ]]; then
             BOARD_FILTER=""
+          fi
+          # Push-triggered runs build the boards this fork maintains instead of the
+          # upstream representative set; manual dispatch keeps its full-matrix default.
+          if [[ -z "$BOARD_FILTER" && "$EVENT_NAME" == "push" ]]; then
+            BOARD_FILTER="$MAINTAINED_BOARDS"
           fi
           export XIAOZHI_BOARD_FILTER="$BOARD_FILTER"
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then

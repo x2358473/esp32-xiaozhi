@@ -1839,10 +1839,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         selected = _select_variants_for_changes(variants, sys.stdin.read().splitlines())
         board_filter = os.environ.get("XIAOZHI_BOARD_FILTER", "").strip()
         if board_filter:
-            # Keep only the requested board. Filter the full variant list rather than
-            # `selected`: shared files (workflows/scripts) select one representative
-            # variant per group, which may not be this board and would empty the matrix.
-            selected = [v for v in variants if v.get("board") == board_filter]
+            # Keep only the requested board(s); the value may be a comma-separated list.
+            # Filter the full variant list rather than `selected`: shared files
+            # (workflows/scripts) select one representative variant per group, which may
+            # not be this board and would empty the matrix.
+            wanted = {name.strip() for name in board_filter.split(",") if name.strip()}
+            matched = [v for v in variants if v.get("board") in wanted]
+            if selected:
+                # An empty intersection with a non-empty selection means the change was
+                # not board-specific, so build every requested board instead of nothing.
+                selected = [v for v in selected if v.get("board") in wanted] or matched
+            else:
+                selected = []
         print(json.dumps(selected))
         return
 

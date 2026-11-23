@@ -24,9 +24,9 @@
 | `main/audio/codecs/box_audio_codec.{h,cc}` | ① 构造函数新增第 17 个参数 `int i2c_clock_speed_hz = 0`（0 = 沿用组件默认 100 kHz），非 0 时额外打印一次 ctrl_if 读/写诊断日志；② `.dma_frame_num` 改为按输出采样率缩放 `AUDIO_CODEC_DMA_FRAME_NUM * output_sample_rate_ / 16000` | 16 kHz 板卡上表达式恒等（240），24 kHz 板卡缓冲时长保持约 90 ms；默认参数保证其它板卡零影响 |
 | `main/boards/common/rlcd_driver.{h,cc}`（原来的 waveshare 私有驱动） | ST7305 400×300 1 bpp 的 SPI 驱动上收为公共文件，构造函数新增 `spi_host` 与 `pclk_hz` 参数 | 被本仓库两块 RLCD 板共用 |
 | `main/boards/common/rlcd_display.{h,cc}` | 新增 `RlcdLcdDisplay : LcdDisplay`：自己 `lv_init` + `lvgl_port_init` + 定长 PSRAM 帧缓冲，RGB565 转灰度阈值 160 二值化 | 可选实现，标准 UI 的 RLCD 板直接用它 |
-| `.github/workflows/build.yml` | 产物改名 `xiaozhi_<board>_<sha7>.bin`，附带 assets 分区镜像与 `_full.bin`、`xiaozhi.elf/.map`，`main` 分支或手动触发时自动发 Release；新增 `workflow_dispatch` 的 `board` 输入 | 只影响 CI，不影响固件 |
+| `.github/workflows/build.yml` | 产物改名 `xiaozhi_<board>_<sha7>.bin`，附带 assets 分区镜像与 `_full.bin`、`xiaozhi.elf/.map`，`main` 分支或手动触发时自动发 Release；新增 `workflow_dispatch` 的 `board` 输入；`push`/`pull_request` 加 `paths-ignore`（纯文档改动不启用 workflow）；`push` 触发时只编 `MAINTAINED_BOARDS`（本仓库四块板） | 只影响 CI，不影响固件 |
 | `scripts/make_full_image.py`、`scripts/decode_backtrace.py` | 新增：把 app 与 assets 拼成整片镜像（按 `flash_args` 的偏移覆盖，先清 0xFF）；用 `pyelftools` 还原固件崩溃回溯 | 工具脚本 |
-| `scripts/build.py` | 支持环境变量 `XIAOZHI_BOARD_FILTER`，把「按改动文件选变体」的结果再按板卡名过滤 | 默认未设置时行为不变 |
+| `scripts/build.py` | 支持环境变量 `XIAOZHI_BOARD_FILTER`（逗号分隔多个板卡目录，如 `gezipai,luobo/esp32-s3-nano-rlcd`），把「按改动文件选变体」的结果再按板卡过滤；公共文件改动导致交集为空时改编该列表里的全部板卡，避免退回上游 18 个代表性变体 | 默认未设置时行为完全不变 |
 | `main/boards/waveshare/esp32-s3-rlcd-4.2/managers/sensor_manager.cc` | `secret_config.h` 的 include 去掉 `../`（靠板卡目录在 include 路径里解析） | 修上游静态检查 `test_relative_board_includes_exist` |
 
 ## 编译
