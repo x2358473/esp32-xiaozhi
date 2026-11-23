@@ -54,6 +54,9 @@ git merge upstream/main                # 冲突热点见文末
 `upstream` 的 tag 抓到了 `refs/tags/upstream/<版本>` 命名空间下，避免和本地 tag 同名冲突；
 要看官方某个版本用 `git diff upstream/v2.7.0 -- main/`。
 
+硬性规则见 `AGENTS.md` 的「Git workflow (hard rule for this fork)」：`main` 只 merge、绝不 rebase /
+amend / force-push，否则以后所有同步都会失效。
+
 ## 仓库历史
 
 - 2026-11-22：把历史重建到官方基线上。原来的 v2.6.0 是整树 squash 的 `428e985`（父提交为另一个

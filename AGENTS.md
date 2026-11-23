@@ -1,5 +1,20 @@
 # AGENTS.md
 
+## Git workflow (hard rule for this fork)
+
+`main` is the only long-lived branch. It is **official upstream history plus this fork's commits**.
+
+- **Never rebase, amend, or force-push `main`.** Upstream commits may only ever be appended by a merge.
+  This is what keeps `git merge upstream/main` working; rewriting `main` silently breaks every later sync.
+- Sync with upstream only by merging: `git fetch upstream && git merge upstream/main`.
+  The `upstream` remote is intentionally read-only (its push URL is disabled).
+- Fork-specific commits stay as separate commits on top of `main`; do not squash them.
+- Pushing `main` triggers `.github/workflows/build.yml` (build + release artifacts). Build the affected
+  boards and run `python3 -m unittest discover -s scripts/tests -v` before pushing shared-code changes.
+- `port/v2.6.0` (old squashed history) and `archive/xqy-2.6.0` (pre-2.6.0 third-party UI line) are local
+  reference only. Never develop on them and never push them (pushing them shows up as PR prompts on the
+  upstream repository page).
+
 ## Project
 
 XiaoZhi is an ESP-IDF C/C++ voice-assistant firmware supporting many chips, boards, displays, audio devices, and network transports. A build selects exactly one board implementation.
