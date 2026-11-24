@@ -342,3 +342,83 @@ W (315489) Application: Unknown message type: listen
   重新激活到官方服务，用同一套抓包对比延迟。可分辨"赛博链路慢"还是"设备/固件慢"；
   代价是离开赛博授权链（固件与 NVS 均有整片备份，可回滚）。
 - 唤醒召回率统计：修复后需要用连续 10 次以上唤醒样本计算命中率，目前只有 1 次成功样本。
+
+## 15. 设备端 AEC 与实时打断（2026-11-24，已实机验证）
+
+### 15.1 问题：为什么"不能打断"
+
+AEC 分两层，之前只有下面这层是通的：
+
+| 层 | 状态 | 证据 |
+|---|---|---|
+| AFE 内置 AEC（算法） | **一直是开的** | `AUDIO_INPUT_REFERENCE true` → `afe_audio_engine.cc:133 aec_init = codec_->input_reference()`；启动日志 `AFE Pipeline: \|AEC(FD_LOW_COST, NLP_VERY_AGGRESSIVE)\| -> ...` |
+| 应用层 AEC 策略 | **没开** | 构建时 sdkconfig：`# CONFIG_USE_DEVICE_AEC is not set` → `application.cc:35 aec_mode_ = kAecOff` |
+
+`aec_mode_ = kAecOff` 会让 `application.cc:1295 GetDefaultListeningMode()` 返回 `kListeningModeAutoStop`，
+于是进入播放态时走 `application.cc:1087-1091`：
+
+```cpp
+if (listening_mode_ != kListeningModeRealtime) {
+    audio_service_.EnableVoiceProcessing(false);   // ← 上行直接关掉，服务端听不到你
+    audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+}
+```
+
+**结论：不是 AEC 没开，是播放期间上行被关，服务端没有机会听到用户开口。** 唯一的打断途径只剩唤醒词
+（`application.cc:949-950`，Speaking 时命中唤醒词 → `AbortSpeaking(kAbortReasonWakeWordDetected)`）。
+
+### 15.2 改动：板级 `config.json` 加一行
+
+```json
+"CONFIG_USE_DEVICE_AEC=y"
+```
+
+`main/Kconfig.projbuild` 里 `USE_DEVICE_AEC` 的 `depends on` 白名单**已包含** `BOARD_TYPE_CYBERAI_VOCAT_V2_1`，
+所以只差这一行配置。生效后 `aec_mode_ = kAecOnDeviceSide` → 默认 `kListeningModeRealtime` →
+播放期间保持上行（Idle/Connecting 仍然关闭，不是"一直开"）。
+
+启动日志随之出现两条 AFE 管线（上行处理管线常驻）：
+
+```
+AFE Pipeline: [input] -> |AEC(FD_LOW_COST, NLP_VERY_AGGRESSIVE)| -> |VAD(WebRTC)| -> |WakeNet(wn9_nihaoxiaozhi_tts,)| -> [output]
+AFE Pipeline: [input] -> |VAD(WebRTC)| -> [output]
+```
+
+### 15.3 实测结果
+
+镜像：`xiaozhi-aec.bin`（`0x20000`，含麦克风修复 + 设备端 AEC）。
+
+**打断（barge-in）成功** —— 讲长故事时直接说话，不需喊唤醒词：
+
+```
+182458  << 很久以前，炎帝有个小女儿叫女娃。      ← 故事播放中
+        （用户开口，上行正在传，服务端实时判定打断）
+185198  speaking -> listening                  ← TTS 被掐断
+186468  >> 停一下。                            ← ASR 结果
+187878  << 好的，停这儿了。
+```
+
+**副作用检查**：
+
+| 指标 | 无 AEC（对照） | 有 AEC |
+|---|---|---|
+| 唤醒词误触发（自激） | — | 0（4 次 `Wake word detected` 全部对应真实唤醒） |
+| `Encode queue full` | 27 次 | **0 次** |
+| `>>` → 首句 `<<` | 70 / 720 / 1690 / 2310 ms（波动 33×） | **1000 / 1110 / 1120 / 1310 / 1410 / 1420 / 1460 ms**（均值 ≈1.26 s，±20%） |
+
+ASR 8 句全部识别正确（含"停一下""不听了"），未观察到识别质量下降。
+
+### 15.4 上游对照（可反哺）
+
+仓库里 **50 多个板卡**的 `config.json` 都写了 `CONFIG_USE_DEVICE_AEC=y`（waveshare 全系、`espressif/esp32-s3-box-3`、
+`chd/esp32-s3-box`、`gezipai`、`rymcu`、`alientek`、`luobo` 等），端侧 AEC + 实时打断是官方主流做法。
+
+但同门的两块 vocat 板——`espressif/esp-vocat` 与 `cyberai/cyber-vocat-v2.1`——原本都只有那 3 行 `sdkconfig_append`，
+**都没开 AEC**。本板已实测开启后收益明确，是同源硬件上的一个可上报改进。
+
+### 15.5 未解决：服务端下发的 `listen` 仍被丢弃
+
+每轮会话都会出现 `W Application: Unknown message type: listen`（单轮 18 次），
+而出厂固件 2.1.0.5 认识这条消息（固件字符串里有 `TX listen start: %s`、
+`{"type":"listen","state":"start","mode":"realtime"}`、以及 `session.update`/`chat_route`/`asr_strategy` 一整套私有协商）。
+下一步：在 `application.cc:759` 打印完整 payload，再决定是否实现。
