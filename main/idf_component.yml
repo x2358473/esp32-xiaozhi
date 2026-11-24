@@ -26,7 +26,14 @@ dependencies:
   waveshare/custom_io_expander_ch32v003: ^2.0.0
   espressif/esp_lcd_panel_io_additions: ^1.0.1~1
   78/esp_lcd_nv3023: ==1.0.1
-  78/esp-wifi-connect: ~3.3.3
+  # Vendored (vendor/esp-wifi-connect) to carry the StartStation() reentrancy
+  # fix: the config-AP stop path notifies ConfigModeExit synchronously, the
+  # listener calls StartStation() again, and the outer call would then create a
+  # second "WIFI_STA_DEF" netif and assert with "duplicate key". Re-check
+  # station_active_ after re-acquiring the lock.
+  78/esp-wifi-connect:
+    version: ~3.3.3
+    override_path: ../vendor/esp-wifi-connect
   # Stay below the P4 rev>=3.0 CMake gate until rev-1.x boards are retired.
   espressif/esp_audio_effects: ~1.3.0
   espressif/esp_audio_codec: ~2.5.0
