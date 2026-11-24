@@ -4,7 +4,17 @@
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
 
+#include <vector>
+
 #define TAG "BoxAudioCodec"
+
+#if CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_1
+// ES7210 TDM 槽序为 MIC1, MIC3, MIC2, MIC4。本板 MIC1 几乎收不到人声，
+// MIC2 是可用主麦，MIC3 是喇叭回采（AEC 参考），因此取 slot2/slot1。
+static constexpr size_t kV2_1MicTdmSlot = 2;
+static constexpr size_t kV2_1RefTdmSlot = 1;
+static std::vector<int16_t> s_v2_1_tdm_buffer;
+#endif
 
 BoxAudioCodec::BoxAudioCodec(void* i2c_master_handle, int input_sample_rate, int output_sample_rate,
                              gpio_num_t mclk, gpio_num_t bclk, gpio_num_t ws, gpio_num_t dout,
@@ -224,9 +234,19 @@ void BoxAudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
+#if CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_1
+        // 主麦在 slot2，必须采满 4 个 TDM 槽才能拿到，读回后在 Read() 里重排。
+        fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2) |
+                           ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3);
+#endif
         ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
+#if CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_1
+        // 通道 0 是坏麦，增益必须下发到全部通道。
+        ESP_ERROR_CHECK(esp_codec_dev_set_in_gain(input_dev_, input_gain_));
+#else
         ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(
             input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+#endif
         if (input_reference_ && reference_gain_channel_ >= 0) {
             // ES7210 gain masks use physical MIC numbering, which differs
             // from the TDM slot order (MIC1, MIC3, MIC2, MIC4).
@@ -263,6 +283,23 @@ void BoxAudioCodec::EnableOutput(bool enable) {
 }
 
 int BoxAudioCodec::Read(int16_t* dest, int samples) {
+#if CONFIG_BOARD_TYPE_CYBERAI_VOCAT_V2_1
+    if (input_enabled_ && input_reference_ && (samples % 2) == 0) {
+        const size_t frames = static_cast<size_t>(samples) / 2;
+        s_v2_1_tdm_buffer.resize(frames * 4);
+        const esp_err_t ret = esp_codec_dev_read(input_dev_, s_v2_1_tdm_buffer.data(),
+                                                 s_v2_1_tdm_buffer.size() * sizeof(int16_t));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "V2.1 TDM read failed: %s", esp_err_to_name(ret));
+            return 0;
+        }
+        for (size_t frame = 0; frame < frames; ++frame) {
+            dest[frame * 2] = s_v2_1_tdm_buffer[frame * 4 + kV2_1MicTdmSlot];
+            dest[frame * 2 + 1] = s_v2_1_tdm_buffer[frame * 4 + kV2_1RefTdmSlot];
+        }
+        return samples;
+    }
+#endif
     if (input_enabled_) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(input_dev_, (void*)dest, samples * sizeof(int16_t)));
     }

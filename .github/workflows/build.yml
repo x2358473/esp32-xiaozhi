@@ -29,7 +29,7 @@ permissions:
 env:
   # This fork only maintains these boards; push-triggered runs build them instead of the
   # upstream representative set (comma-separated board directories, see scripts/build.py).
-  MAINTAINED_BOARDS: waveshare/esp32-s3-rlcd-4.2,waveshare/esp32-s3-touch-lcd-1.54,luobo/esp32-s3-nano-rlcd,gezipai
+  MAINTAINED_BOARDS: waveshare/esp32-s3-rlcd-4.2,waveshare/esp32-s3-touch-lcd-1.54,luobo/esp32-s3-nano-rlcd,gezipai,cyberai/cyber-vocat-v2.1
 
 jobs:
   prepare:

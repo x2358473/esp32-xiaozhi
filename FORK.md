@@ -15,6 +15,11 @@
 | 微雪 ESP32-S3-Touch-LCD-1.54（240×240 触摸彩屏） | `esp32-s3-touch-lcd-1.54` | `main/boards/waveshare/esp32-s3-touch-lcd-1.54/` | [README](main/boards/waveshare/esp32-s3-touch-lcd-1.54/README.md) |
 | luobo ESP32-S3-Nano RLCD 4.2（ST7305 + CST836U 触摸） | `esp32-s3-nano-rlcd` | `main/boards/luobo/esp32-s3-nano-rlcd/` | [README](main/boards/luobo/esp32-s3-nano-rlcd/README.md) |
 | 格子派 AI-2E（无屏，ES8311/ES7210，4G 预留） | `gezipai` | `main/boards/gezipai/` | [README](main/boards/gezipai/README.md) |
+| 赛博喵伴 V2.1 / CyberAI Vocat（ESP32-S3，360×360 圆屏，实机为开发目标） | `cyber-vocat-v2.1` | `main/boards/cyberai/cyber-vocat-v2.1/` | [README](main/boards/cyberai/cyber-vocat-v2.1/README.md)、[实机笔记](docs/cyber-vocat-v2.1-notes.md) |
+
+> 赛博喵伴 V2.1 是上游板卡，本仓库已在实机上验证并做了最小改动（TDM 麦克风槽位、设备端 AEC），
+> 其余保持上游原样。实机测试、与出厂固件的差距、TF 卡/MP3 的落点都记在
+> [docs/cyber-vocat-v2.1-notes.md](docs/cyber-vocat-v2.1-notes.md)。
 
 ## 相对上游的公共改动
 

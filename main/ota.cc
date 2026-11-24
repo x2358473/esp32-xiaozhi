@@ -57,6 +57,15 @@ Ota::~Ota() {
 }
 
 std::string Ota::GetCheckVersionUrl() {
+    // 实验开关（方案 T）：忽略 NVS 里缓存的 ota_url，强制使用编译期默认地址
+    // CONFIG_OTA_URL（api.tenclass.net），用于对比官方服务与赛博服务的往返延迟。
+    // 改回 false 即恢复"优先使用服务端下发地址"的原行为。
+    static constexpr bool kPreferCompiledOtaUrl = false;
+    if (kPreferCompiledOtaUrl) {
+        ESP_LOGW(TAG, "Experimental: forcing compiled OTA URL %s", CONFIG_OTA_URL);
+        return CONFIG_OTA_URL;
+    }
+
     Settings settings("wifi", false);
     std::string url = settings.GetString("ota_url");
     if (!wifi_config::IsValidOtaUrl(url)) {

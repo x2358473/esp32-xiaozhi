@@ -121,3 +121,19 @@ idf.py flash monitor
 - 连接充电电源时显示充电状态，低电量时显示提醒；专用动画在表情动画风格下使用。
 
 GPIO0 用于 USB 转串口自动下载电路，不作为用户按键使用。
+
+## 本仓库实机备注
+
+以下事实来自本仓库对实机（`SKU=cyber-vocat`，出厂固件 `2.1.0.5`）的串口测试与整片备份分析，
+完整记录见 [docs/cyber-vocat-v2.1-notes.md](../../../docs/cyber-vocat-v2.1-notes.md)。
+
+- **分区表与出厂固件不同**：出厂固件是 `ota_0`/`ota_1` 各 5120 KB、`assets` 6016 KB @ `0xA20000`；
+  本仓库 `partitions/v2/16m.csv` 是 4032 KB + 4032 KB、`assets` 8 MB @ `0x800000`。
+  第一次把本仓库固件烧到出厂设备上必须**整片烧 `0x0`**；只写 `0x20000` 会因 assets 偏移不同而丢资源。
+- **麦克风槽位待实机验证**：本板卡传入的 codec 参数走默认通道，即 ES7210 TDM **槽 0 = MIC1**；
+  出厂固件把可用麦克风放在**槽 2（MIC2）**、槽 1 作回采参考。上板先确认识别与唤醒效果，
+  需要时在板级重排通道，不要改动 `channel_mask` 的通用语义。
+- **TF 卡尚未实现**：`config.h` 定义了 `BSP_SD_*` 和 `MOUNT_POINT`，但板级没有挂载代码，
+  也没有本地 MP3 播放与 `self.sdcard.*` 工具（出厂固件具备这些能力）。
+- **不再走赛博授权链**：本仓库固件默认 `CONFIG_OTA_URL = https://api.tenclass.net/xiaozhi/ota/`，
+  出厂固件绑定 `xiaozhi.cyberai.top` 并使用 `ota.cyberai.top`。刷本仓库固件前请先确认服务归属。
