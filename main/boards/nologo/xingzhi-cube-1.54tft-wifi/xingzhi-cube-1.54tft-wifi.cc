@@ -28,6 +28,8 @@ private:
     PowerManager* power_manager_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
+    bool volume_mode_ = false;
+    bool screen_off_ = false;
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
@@ -45,22 +47,16 @@ private:
         rtc_gpio_set_direction(GPIO_NUM_21, RTC_GPIO_MODE_OUTPUT_ONLY);
         rtc_gpio_set_level(GPIO_NUM_21, 1);
 
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
+            screen_off_ = true;
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(1);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            screen_off_ = false;
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            ESP_LOGI(TAG, "Shutting down");
-            rtc_gpio_set_level(GPIO_NUM_21, 0);
-            // 启用保持功能，确保睡眠期间电平不变
-            rtc_gpio_hold_en(GPIO_NUM_21);
-            esp_lcd_panel_disp_on_off(panel_, false); //关闭显示
-            esp_deep_sleep_start();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -76,15 +72,88 @@ private:
         ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
 
+    // 音量调节模式：长按进入，模式内单击 +10 / 双击 -10（均在 0-100 循环），再次长按退出。
+    // 正常页面单击仍是对话开关，双击切换息屏/亮屏。
+    void ShowVolumeHud(int volume) {
+        // 长时间显示，靠退出模式时的 HideNotification() 主动清除
+        GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume) + "%", 3600 * 1000);
+    }
+
+    void EnterVolumeMode() {
+        volume_mode_ = true;
+        ShowVolumeHud(GetAudioCodec()->output_volume());
+    }
+
+    void ExitVolumeMode() {
+        volume_mode_ = false;
+        GetDisplay()->HideNotification();
+    }
+
+    void AdjustVolume(int delta) {
+        auto codec = GetAudioCodec();
+        int volume = codec->output_volume() + delta;
+        volume %= 101;
+        if (volume < 0) {
+            volume += 101;
+        }
+        codec->SetOutputVolume(volume);
+        ShowVolumeHud(volume);
+    }
+
+    void ToggleScreenOff() {
+        screen_off_ = !screen_off_;
+        GetDisplay()->SetPowerSaveMode(screen_off_);
+        if (screen_off_) {
+            GetBacklight()->SetBrightness(1);
+        } else {
+            GetBacklight()->RestoreBrightness();
+            power_save_timer_->WakeUp();
+        }
+    }
+
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
+            if (screen_off_) {
+                ToggleScreenOff();
+                return;
+            }
             power_save_timer_->WakeUp();
+            if (volume_mode_) {
+                AdjustVolume(10);
+                return;
+            }
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting) {
                 EnterWifiConfigMode();
                 return;
             }
             app.ToggleChatState();
+        });
+
+        boot_button_.OnDoubleClick([this]() {
+            if (screen_off_) {
+                ToggleScreenOff();
+                return;
+            }
+            power_save_timer_->WakeUp();
+            if (volume_mode_) {
+                AdjustVolume(-10);
+                return;
+            }
+            ToggleScreenOff();
+        });
+
+        boot_button_.OnLongPress([this]() {
+            if (screen_off_) {
+                ToggleScreenOff();
+                return;
+            }
+            power_save_timer_->WakeUp();
+            if (volume_mode_) {
+                ExitVolumeMode();
+            } else {
+                EnterVolumeMode();
+            }
         });
 
         volume_up_button_.OnClick([this]() {
@@ -152,7 +221,7 @@ private:
 
 public:
     XINGZHI_CUBE_1_54TFT_WIFI() :
-        boot_button_(BOOT_BUTTON_GPIO),
+        boot_button_(BOOT_BUTTON_GPIO, false, 800),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
         InitializePowerManager();

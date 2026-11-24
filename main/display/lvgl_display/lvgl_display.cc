@@ -191,6 +191,18 @@ void LvglDisplay::ShowNotification(const char* notification, int duration_ms) {
     ESP_ERROR_CHECK(esp_timer_start_once(notification_timer_, duration_ms * 1000));
 }
 
+void LvglDisplay::HideNotification() {
+    DisplayLockGuard lock(this);
+    if (notification_label_ == nullptr) {
+        return;
+    }
+    esp_timer_stop(notification_timer_);
+    lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+    if (status_label_ != nullptr) {
+        lv_obj_remove_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void LvglDisplay::UpdateStatusBar(bool update_all) {
     auto& app = Application::GetInstance();
     auto& board = Board::GetInstance();
