@@ -755,8 +755,21 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
             }
 #endif
+        } else if (strcmp(type->valuestring, "listen") == 0) {
+            // 赛博服务端用 listen 下发回合指令（state=start + mode=realtime|auto）：realtime 与
+            // ASR 结果同时到达（"我要说话，保持上行"），auto 在 TTS 收尾时到达（"回到自动听"）。
+            // 这与本固件默认的 Realtime 监听行为一致，因此只记录、不驱动状态机——强行
+            // SetListeningMode() 会把设备从 Speaking 拉回 Listening 而打断 TTS。
+            auto state = cJSON_GetObjectItem(root, "state");
+            auto mode = cJSON_GetObjectItem(root, "mode");
+            ESP_LOGI(TAG, "Server listen: state=%s mode=%s (ignored)",
+                     cJSON_IsString(state) ? state->valuestring : "?",
+                     cJSON_IsString(mode) ? mode->valuestring : "?");
         } else {
-            ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
+            // 其余未知消息打印完整内容，便于分析服务端的私有协议。
+            CJsonStringUniquePtr unknown_json(cJSON_PrintUnformatted(root));
+            ESP_LOGW(TAG, "Unknown message type: %s payload=%s", type->valuestring,
+                     unknown_json ? unknown_json.get() : "");
         }
     });
 
