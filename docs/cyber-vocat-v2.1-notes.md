@@ -416,9 +416,260 @@ ASR 8 句全部识别正确（含"停一下""不听了"），未观察到识别�
 但同门的两块 vocat 板——`espressif/esp-vocat` 与 `cyberai/cyber-vocat-v2.1`——原本都只有那 3 行 `sdkconfig_append`，
 **都没开 AEC**。本板已实测开启后收益明确，是同源硬件上的一个可上报改进。
 
-### 15.5 未解决：服务端下发的 `listen` 仍被丢弃
+### 15.5 服务端下发的 `listen`：已取证并结案（`efc317d5`）
 
-每轮会话都会出现 `W Application: Unknown message type: listen`（单轮 18 次），
-而出厂固件 2.1.0.5 认识这条消息（固件字符串里有 `TX listen start: %s`、
-`{"type":"listen","state":"start","mode":"realtime"}`、以及 `session.update`/`chat_route`/`asr_strategy` 一整套私有协商）。
-下一步：在 `application.cc:759` 打印完整 payload，再决定是否实现。
+出厂固件 2.1.0.5 认识这条消息（字符串里有 `TX listen start: %s`、
+`{"type":"listen","state":"start","mode":"realtime"}`，以及 `session.update`/`chat_route`/`asr_strategy` 一整套私有协商）。
+
+在 `application.cc` 打印完整 payload 后抓到单轮 19 条：
+
+| 次数 | payload | 到达时刻 |
+|---|---|---|
+| 12 | `{"mode":"realtime","session_id":"device-44_BD_8D_7C_CC_AC","state":"start","type":"listen"}` | 与 ASR 结果（`>>`）**同一毫秒** |
+| 6 | 同上，`"mode":"auto"` | TTS 结束、`speaking -> listening` 的**那一毫秒** |
+| 1 | `{"auth_mode":"static","enabled":true,"type":"juphoon.config","uid":"44BD8D7CCCAC"}` | 会话建立时 |
+
+```
+I (396718) Application: >> 讲个故事。
+W (396728) Unknown message type: listen MODE=realtime   ← 与 ASR 同时
+I (396728) StateMachine: State: listening -> speaking
+...
+I (408388) StateMachine: State: speaking -> listening
+W (408398) Unknown message type: listen MODE=auto        ← TTS 收尾时
+```
+
+**结论**：`listen` 是**回合指令**——`realtime` = "我要说话，别关上行"，`auto` = "这一轮结束，回到自动听"，
+与本固件默认的 `kListeningModeRealtime` 行为天然一致。按字面实现（`SetListeningMode()`）反而会把设备
+从 Speaking 拉回 Listening 而**打断 TTS**，所以只记录、不驱动状态机；`juphoon.config` 出厂固件同样不解析
+（固件里 `juphoon` 字符串计数为 0），不是差异点，"菊风导致慢"的推测一并撤回。
+
+## 16. 在线音乐/故事点播：方案（设计完成，暂不实施）
+
+目标：把音频放云端，设备通过 MCP 工具让 LLM 先检索再播放，取代"TF 卡本地写死搜索"。
+
+### 16.1 现成通路（不用写解码器）
+
+| 组件 | 位置 | 作用 |
+|---|---|---|
+| `NotifyPlayer` | `main/notify/notify_player.cc:30-77`、`:174-289` | `Start(url)` → HTTP GET → `OggDemuxer` 拆包 → `PushPacketToDecodeQueue`，复用现有 opus 解码与播放队列；带字幕/进度/完成回调 |
+| `Application::StartNotification()` | `main/application.cc:1209-1253` | 切 `kDeviceStateNotifying`、关麦、释放唤醒词、播提示音、调起 NotifyPlayer |
+| 协议入口 | `main/application.cc:625-656` | `{"type":"notify","audio_url":...}` |
+| 采样率自适应 | `main/audio/audio_service.cc:408`、`:429-441` | 按包的 `sample_rate` 重配解码器并开 `output_resampler_`（16k→24k 自动） |
+
+### 16.2 待实现部分（约 250 行）
+
+1. `main/application.h` 公开区加薄封装（`StartNotification` 现在是 private，`:180-182`）：
+   `bool PlayMediaUrl(const std::string& url);` / `void StopMediaPlayback();`
+2. 新增板级 `main/boards/cyberai/cyber-vocat-v2.1/cloud_media.{h,cc}`（`main/CMakeLists.txt:1007`
+   已 glob `boards/${BOARD_DIR}/*.cc`，无需改 CMakeLists）：目录拉取 + PSRAM 缓存 + 搜索 + 异步播放。
+3. 四个 MCP 工具（注册方式见 `main/boards/chd/chd-esp32s3-box/chd_esp32s3_box_board.cc:701-711`）：
+   `self.media.search`（keyword, limit）、`self.media.play`（title|id）、`self.media.stop`、
+   `self.media.set_catalog`（url，user-only）。
+4. `tools/make_catalog.py`：扫目录 → ffmpeg 转码 → 生成 `catalog.json`；静态托管（HTTPS）即可。
+
+```bash
+ffmpeg -i 故事.mp3 -c:a libopus -b:a 24k -ar 16000 -ac 1 故事.ogg
+```
+
+```json
+[{"id":1,"title":"小王子 01","tags":"故事 睡前 童话","seconds":412,"url":"https://cdn.example.com/a/1.ogg"}]
+```
+
+### 16.3 实施前必须接受的约束
+
+1. **格式只能是 Ogg/Opus**（复用现成解码器），MP3/WAV/AAC 需先转码。24 kbps 单声道，10 分钟约 1.8 MB。
+2. **播放期间麦克风关闭、唤醒词资源被释放**（`application.cc:1217-1219`）→ 不能用语音打断/切歌，播完才恢复。
+3. **工具必须异步**：调用瞬间设备在 Speaking（TTS 播"好的"），而 `StartNotification` 只接受 Idle
+   （`application.cc:1210`）；worker 要等 Idle（上限 10 s）再起播，工具立即返回。
+4. 目录建议 ≤ 500 条（常驻 PSRAM）；网络失败要返回明确错误，避免模型反复重试。
+
+状态：**仅记录，按用户要求暂不实施**（2026-11-24）。
+
+## 17. 触摸交互重做：下拉设置页 + 双击打断（2026-11-24）
+
+### 17.1 为什么废弃上一版「手势热区」
+
+上一版是纯手势：屏幕上没有任何可看的控件，靠 `dy>40`、`|dy|>|dx|` 这类阈值猜意图，单击直接打断对话。
+没有参照物、没有可见反馈，任何一次抖动都会被解释成一次调节或一次打断——这是设计问题，不是阈值问题。
+新版改成**一页可视控件**：动作与位置一一对应，滑条本身显示当前值。
+
+### 17.2 界面
+
+LVGL 全屏页（360×360 圆屏，按圆心 `(180,180)`、半径 160 的安全圆排布）：
+
+```
+          设置            y=32
+   亮度  ▬▬▬▬▬●▬▬  70%   y=78
+   音量  ▬▬▬●▬▬▬▬  45%   y=124
+   息屏  ▬▬▬▬●▬▬▬  10 分  y=170
+      智信智能WIFI  -58dBm
+      192.168.31.42        y=206
+   [ AEC 开 ]  [ 配网 ]    y=252
+         上滑关闭           y=300
+```
+
+「关闭」按钮已删除：底部按钮在圆屏边缘最容易误触，上滑关闭一条路更安全，页面底部用小字把这条出路写出来
+（提示文字不是控件，不参与命中测试）。
+
+配色：底 `#0E1116`、字 `#F2F4F8`、次要 `#9AA4B8`、轨道 `#2C3240`、亮度橙 `#FFC447`、音量蓝 `#4FC3F7`、
+按钮 `#2A3140`、AEC 开绿 `#2E7D32` / 关红 `#5A3038`。
+
+### 17.3 为什么是 LVGL，而不是在 emote 上自绘（两次失败后的结论）
+
+前两版都试过「用 `emote_create_obj_by_type` 在 emote 场景里加 label 当控件」，上机后有三个无解问题：
+
+1. **场景对象穿透**：`eye_anim`/`toast_label` 会被 emote 自己重新点亮——`emote_set_emoji()`（`emote_op.c:534`）
+   与状态切换（`:583`）都会 `SHOW_OBJ(...ANIM_EYE)`，一次性 `emote_set_anim_visible(false)` 必被撤销。
+   曾用 120 ms 定时器持续压制 10 个场景对象，仍然只能做到"大部分时间盖住"。
+2. **纯文字 label 不出像素**：有底色的 label 能画出来，`bg_enable=false` 的只画空气（mask 路径问题，
+   串口无报错，改 `long_mode`/重设文本均无效）。
+3. **没有分页**：`esp_emote_assets` 每个分辨率只有一份 `{config,emote,layout}.json`，gfx 也没有 z 序/置顶 API，
+   原厂那种"菜单首页 + 聊天子页"的结构在这套栈里不存在。
+
+LVGL 一次解决三个问题：换页即整屏重画（旧内容不再绘制），有真滑条/圆角/按钮/手势，文本走 `lv_font_t`。
+代价只是"开页期间 emote 暂时不出图"，猫脸动画本身完全保留。
+
+### 17.4 双栈共存的接缝（`main/display/emote_display.*`）
+
+一块屏只有一个 flush 回调，它归 `EmoteDisplay`。新增三个接口让它把屏让出来：
+
+| 接口 | 作用 |
+|---|---|
+| `SetPanelSuspended(bool)` | 置位后 `OnFlushCallback` **跳过 `esp_lcd_panel_draw_bitmap` 但照旧调 `emote_notify_flush_finished`**（漏掉这一步 emote 渲染任务会持锁永久阻塞） |
+| `SetFlushDoneHook(hook, ctx)` | 借 `OnFlushIoReady`（`on_color_trans_done` 已由 emote 注册，不能再注册第二套）转发"这一块传完了"，供 LVGL 同步 |
+| `IsPanelSuspended()` | 状态查询 |
+
+LVGL 侧 `LvglSettings::FlushCallback` 自己调 `esp_lcd_panel_draw_bitmap`（就是 `DmaPanel`），然后等 hook 给的
+二值信号量（200 ms 超时只 warn），最后 `lv_display_flush_ready()`。
+
+### 17.5 手势表（防误触是首要目标）
+
+| 状态 | 手势 | 结果 |
+|---|---|---|
+| 页面关 | 顶部下拉（起点 `y<120`、`dy>70`、`\|dy\|>\|dx\|`） | 打开页面 |
+| 页面关 | **双击**（间隔 `≤380 ms`、两次落点 `≤30 px`） | 打断 / 开始对话 |
+| 页面关 | 单击、长按 | **无动作**（单击彻底废弃；仅 `kDeviceStateStarting` 时单击进配网） |
+| 页面开 | 拖滑条 | 实时调亮度 / 音量 / 息屏分钟数 |
+| 页面开 | 上滑（`dy>70` 且 `\|dy\|>\|dx\|`） | 关闭页面 |
+| 页面开 | 点「AEC」「配网」 | 切 AEC / 进配网 |
+| 页面开 | 其它点击、以及任何打断 | 忽略（LVGL 只看到页内控件） |
+| 息屏 | 任意触摸 | **只唤醒**，不连带触发对话（该次触摸被吞掉） |
+| 息屏 | 拿起设备（加速度突变 > 1000 mg） | 唤醒 |
+| 聆听/说话中 | 屏幕朝下持续 800 ms | 停止聆听 / 打断说话 |
+
+三条硬规则：①**亮度夹在 5–100**，不会把屏幕调黑；②**页面打开期间彻底屏蔽打断**；③页面 10 s 无操作自动关闭
+（`esp_timer`，任何触摸都会重置）。
+
+### 17.8 自动息屏（`screen_off_minutes`）
+
+待机时屏幕是最大耗电项：背光（19% 亮度）约 25–40 mA、面板持续刷新约 10–15 mA，而整机待机约 100–130 mA，
+所以息屏能省掉三分之一到一半的待机电流。做法：
+
+- 滑条 `0–30 分钟`（连续），`0` 显示「关闭」= 永不息屏；默认 10 分钟；持久化在 NVS `display/screen_off_minutes`
+  （滑条抬手才写，拖动过程中只改显示）。
+- 板上一个 `esp_timer`（名字 `screen_off`，`ESP_TIMER_TASK`，`skip_unhandled_events`）单次定时，**任何触摸、
+  关闭设置页都会重置**；`0` 分钟时直接不启用。
+- 触发：`SetBrightness(0)` + `esp_lcd_panel_disp_on_off(lcd_panel_, false)` + `emote::SetPanelSuspended(true)`
+  （息屏期间 emote 不再出图，省 CPU）。
+- 唤醒：`disp_on_off(true)` → `SetPanelSuspended(false)` → `EmoteDisplay::RefreshAll()` → 恢复息屏前的亮度。
+- 三种情况**不睡**：①`kDeviceStateListening`/`kDeviceStateSpeaking`（正在用）；②`IsInWifiConfigMode()`（屏上是配网二维码）；
+  ③设置页开着（`LvglSettings::IsOpen()`，避免在用户手指下黑屏）。
+
+注意 `DmaPanel` 自己没实现 `disp_on_off`（`esp_lcd_panel_t` 里是空指针，直接调会崩），所以板级另外保存了原始面板句柄
+`lcd_panel_`，开关屏都走它。
+
+### 17.9 姿态：抬起唤醒与屏幕朝下静音
+
+`QMA6100P` 是**三轴加速度计**（±4 g，`Motion::ReadAccel()` 输出 mg），不是陀螺仪——能测倾角与晃动，测不了绕竖轴旋转。
+`imu_event_task` 80 ms 采样，新增两件事（都放在 `#if CONFIG_USE_EMOTE_MESSAGE_STYLE` 内）：
+
+- **抬起唤醒**：息屏状态下 `|dx|+|dy|+|dz| > 1000`（连续两次采样的加速度差）→ `Schedule(WakeScreen)`。
+  阈值比"摇一摇换表情"（2000）低，因为拿起比摇晃轻。
+- **屏幕朝下静音：已评估、未采用（2026-11-24 决定先不做）**。试过两版实现，实机均未触发：
+  ① 单轴方案——开机把 `z` 记为基准，此后 `z` 反号且 `|z| > 700 mg` 判为朝下，持续 800 ms 生效；
+  ② 向量方案——基准存完整向量，仅在**同向**（归一化点积 > 0.8）时以 7:1 缓慢跟随，判定为归一化点积
+  `< −0.5`（翻转 > 120°）且模长 > 400 mg、持续 600 ms，另加每 5 s 一条 `accel x,y,z dot face_down state` 日志。
+
+  实测数据（第二版日志）：正放时重力向量 **(-180, -607, -1117) mg，模长 1275 mg**（传感器带偏置、且安装是斜的）；
+  用户"把屏幕盖到桌面"时观察到的最好一次是 `(-1065, -585, 150) dot 360`，即只转了约 70°，始终没到 120° 阈值。
+  推测与背面弧度/机身摆放姿势有关，未继续深究。**结论：加速度计判"扣到桌上"在这台机器上不稳，先撤掉**，
+  `imu_event_task` 恢复为「摇一摇换表情 + 抬起唤醒」两件事，无额外日志。若日后重启此功能，优先考虑用
+  `z` 分量做**相对变化**（`|Δz| > 800 mg` 且 x/y 变大）而不是绝对角度阈值。
+
+### 17.6 文件与接线
+
+| 文件 | 内容 |
+|---|---|
+| `main/boards/cyberai/cyber-vocat-v2.1/lvgl_settings.h` | `cyberai::LvglSettings`：生命周期 + 触摸注入 + 关闭/配网请求标志 |
+| `main/boards/cyberai/cyber-vocat-v2.1/lvgl_settings.cc` | LVGL display/indev/flush、页面构建、滑条与按钮回调、AEC/配网动作、空闲自动关闭 |
+| `main/boards/cyberai/cyber-vocat-v2.1/cyber_vocat.cc` | 建页面（`initializeSt77916Display()` 末尾，`backlight_->RestoreBrightness()` 之后）；`touch_event_task` 分两态：页面开→`FeedTouch()` + 100 ms 超时轮询请求标志，页面关→下拉/双击/单击判定 |
+| `main/display/emote_display.h` / `.cc` | 上面三个让位接口（唯一的共享代码改动，默认关闭，行为不变） |
+
+线程契约：`Show()/Hide()` 只能由**同一个所有者**（`touch_event_task`）调用；LVGL 任务只读原子量、绝不碰 I2C、
+绝不自己拆控件——"关闭页面""进配网"以标志交回所有者。
+
+息屏接线（同一文件 `cyber_vocat.cc`）：成员 `lcd_panel_`（原始面板句柄）、`screen_off_timer_`、`screen_off_`（原子）、
+`saved_brightness_`；方法 `ArmScreenOffTimer()` / `EnterScreenOff()` / `WakeScreen()`。`touch_event_task` 顶部先判
+`screen_off_`（唤醒即 `continue`），每次按下列点与关页后都调 `ArmScreenOffTimer()`。
+
+字体：`sdkconfig` 只开了 `CONFIG_LV_FONT_MONTSERRAT_14`（无中文），但资产里自带 `font_puhui_common_20_4`，
+用 `EmoteDisplay::GetAssetData()` 取 mmap 指针再 `gfx_font_lv_load_from_binary()` 装成 `lv_font_t`，
+不新增 flash 字体、不改 sdkconfig。
+
+音量：`AudioCodec::SetOutputVolume()` 每次都写 NVS，所以滑条拖动只改显示，`LV_EVENT_RELEASED` 才提交一次
+（同时把亮度 `SetBrightness(v,true)` 落盘）。AEC 按钮切 `Application::SetAecMode(kAecOnDeviceSide / kAecOff)`
+并写 `Settings("aec").SetInt("aec_mode", 0|1)`（键名与 `waveshare-s3-rlcd-4.2` 一致）；`SetAecMode()` 在音频通道
+已开时会 `CloseAudioChannel()`，所以切 AEC 会让当前一轮对话重连一次，属预期。
+
+触摸不引入 `gfx_touch_add()`/`esp_lcd_touch`：本板是裸 CST816S，`touch_event_task` 直接把原始坐标喂给
+`FeedTouch()`，LVGL 的 `read_cb` 只读原子坐标。CST816S 只在接触点变化时给 INT，拖动过程中位置在变，
+所以按住期间每 15 ms 轮询 `UpdateTouchPoint()` 并持续 `FeedTouch(true, x, y)`。
+
+### 17.7 验证要点（需上机）
+
+1. 下拉后整屏只有设置页，猫脸/眼睛/toast 一律不可见；关页后猫脸正常且无残影。
+2. 「设置/亮度/音量/息屏/配网」等中文全部正常显示（否则是 `font_puhui_common_20_4` 没加载成功）。
+3. 拖动滑条亮度是否跟手，重启后保持（NVS `display/brightness`、`audio/output_volume`、`display/screen_off_minutes`）。
+4. 单击屏幕**不应**有任何反应；双击才触发对话/打断；页面打开期间点哪里都不打断。
+5. AEC 按钮切换后 `aec_mode` 是否跨重启保持。
+6. 上滑能否关闭页面（页面上已无「关闭」按钮，也没有底部「上滑关闭」提示，滑动手势靠 17.2 的手势表记忆）。
+7. 息屏：把滑条拖到 1 分钟 → 静置 → 屏幕熄灭（串口 `Screen off after 1 min idle`）；触摸一次只亮屏、不触发对话；
+   对话中/配网二维码页不应息屏。
+8. 姿态：息屏时拿起设备应亮屏；聆听或说话时把设备扣在桌上（持续 800 ms）应停止；翻回正面后才可再次触发。
+
+### 17.10 「拖息屏滑条就重启」：NVS 键名超长（2026-11-24）
+
+现象：拖动「息屏」滑条松手后设备复位，重启过程里 WiFi 重新连接，看起来像「滑一下息屏又重连」。
+
+**真根因（串口实证）**：NVS 的键名上限是 **15 字节**，而这一版用的键是 `"screen_off_minutes"`（18 字节），
+`nvs_set_i32()` 直接返回 `ESP_ERR_NVS_KEY_TOO_LONG`，`Settings::SetInt()` 里是 `ESP_ERROR_CHECK`，于是
+`abort()` → `rst:0xc (RTC_SW_CPU_RST)`：
+
+```
+ESP_ERROR_CHECK failed: esp_err_t 0x1109 (ESP_ERR_NVS_KEY_TOO_LONG)
+file: "./main/settings.cc" line 63
+func: void Settings::SetInt(const std::string&, int32_t)
+expression: nvs_set_i32(nvs_handle_, key.c_str(), value)
+abort() was called at PC 0x403871e2 on core 1
+```
+
+键名改为 `"screen_off_min"`（13 字节）即解决。**注：`GetInt` 不会 abort**，所以开机日志一直显示
+`Created (… screen off 10 min)`，只有写入那一刻才炸——这是最初误判成栈溢出的原因。
+
+同时做了两件与根因无关、但同属该路径的收尾（保留）：
+
+- **写盘搬离 LVGL 任务**：`CommitScreenOff()` / `CommitVolume()` 只登记请求，真正的 NVS 写集中在
+  `LvglSettings::HandlePendingCommits()`，由所有者 `touch_event_task` 调用（页面打开期间每轮都调，
+  最迟 100 ms 生效）；它返回 true 表示分钟数变了，紧随的 `ArmScreenOffTimer()` 用新值重排定时器——
+  顺手修掉「改完分钟数但板上定时器仍是旧值」的老问题。
+- LVGL 任务栈 6 KB → 8 KB（`kTaskStack`）。
+
+布局：底部「上滑关闭」提示与 `close_hint_` 已删除，三行滑条行距 46 → 52 px；网络信息上移到 `y=208`，
+AEC/配网按钮下移到 `y=282`、96×36（原先 266/38 紧贴 WiFi 那行）。
+
+教训：**任何 NVS 键名先数字节，别超过 15**（`nvs` 里同名限制也适用于 namespace）；这类错误在写入时才
+断言，读取不报，容易误判成别的问题。
+
+调试提醒：`serial.Serial("COM5", …)` 打开端口会拉高 DTR/RTS，本板 RTS 接 EN，**一开串口设备就复位**。
+抓运行中的日志要用 `E:\gitea\esp-flash\tail_safe.py`（`do_not_open=True` → 先置 `dtr/rts=False` 再 `open()`），
+它接上后不会复位。

@@ -48,11 +48,20 @@ class EmoteDisplay;
 // Helper Functions
 // ============================================================================
 
+// Panel hand-over state, see SetPanelSuspended(). Defaults to "emote owns the panel", so
+// nothing changes for a board that never touches these.
+static std::atomic<bool> s_panel_suspended{false};
+static std::atomic<void (*)(void*)> s_flush_done_hook{nullptr};
+static void* s_flush_done_ctx = nullptr;
+
 static bool OnFlushIoReady(const esp_lcd_panel_io_handle_t panel_io,
                            esp_lcd_panel_io_event_data_t* const edata, void* user_ctx) {
     emote_handle_t handle = static_cast<emote_handle_t>(user_ctx);
     if (handle) {
         emote_notify_flush_finished(handle);
+    }
+    if (s_flush_done_hook != nullptr) {
+        s_flush_done_hook(s_flush_done_ctx);
     }
     return true;
 }
@@ -87,6 +96,13 @@ static void OnFlushCallback(int x_start, int y_start, int x_end, int y_end, cons
         return;
     }
 
+    // A board page owns the panel: keep the renderer flowing, but do not draw. Reporting
+    // completion without a transfer is the same contract as the error path below.
+    if (s_panel_suspended.load(std::memory_order_relaxed)) {
+        emote_notify_flush_finished(handle);
+        return;
+    }
+
     esp_err_t err = esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "draw_bitmap failed (%s) for (%d,%d)-(%d,%d); reporting flush done so the "
@@ -110,6 +126,25 @@ int64_t GetMicrosecondsSinceLastFlush() {
         return -1;  // nothing has been flushed yet; not the same as "a long time ago"
     }
     return esp_timer_get_time() - last;
+}
+
+void SetPanelSuspended(bool suspended) {
+    s_panel_suspended.store(suspended, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "Panel handed over to the board page: %s", suspended ? "yes" : "no");
+}
+
+bool IsPanelSuspended() {
+    return s_panel_suspended.load(std::memory_order_relaxed);
+}
+
+void SetFlushDoneHook(void (*hook)(void* ctx), void* ctx) {
+    if (hook == nullptr) {
+        s_flush_done_hook.store(nullptr, std::memory_order_release);
+        s_flush_done_ctx = nullptr;
+        return;
+    }
+    s_flush_done_ctx = ctx;
+    s_flush_done_hook.store(hook, std::memory_order_release);
 }
 
 // ============================================================================

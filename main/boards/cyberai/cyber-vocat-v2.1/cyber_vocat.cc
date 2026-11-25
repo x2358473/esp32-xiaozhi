@@ -12,6 +12,10 @@
 #include "display/lcd_display.h"
 #include "wifi_board.h"
 
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+#include "lvgl_settings.h"
+#endif
+
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
@@ -504,6 +508,13 @@ private:
     std::unique_ptr<cyberai::DmaPanel> display_dma_panel_;
 #endif
     PwmBacklight* backlight_ = nullptr;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+    std::unique_ptr<cyberai::LvglSettings> settings_page_;
+    esp_lcd_panel_handle_t lcd_panel_ = nullptr;
+    esp_timer_handle_t screen_off_timer_ = nullptr;
+    std::atomic<bool> screen_off_{false};
+    uint8_t saved_brightness_ = 0;
+#endif
     TaskHandle_t charge_task_handle_ = nullptr;
     TaskHandle_t touch_task_handle_ = nullptr;
     TaskHandle_t imu_task_handle_ = nullptr;
@@ -666,6 +677,9 @@ private:
         int64_t last_shake_ms = 0;
         constexpr int kShakeDeltaThreshold = 2000;
         constexpr int64_t kShakeCooldownMs = 2000;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        constexpr int kPickUpDeltaThreshold = 1000;
+#endif
 
         while (true) {
             if (Motion::ReadAccel(cur)) {
@@ -684,6 +698,12 @@ private:
                         Application::GetInstance().Schedule(
                             [self]() { self->ShowTemporaryEmotion("confused", 1800); });
                     }
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+                    // Picking the device up wakes a blanked screen.
+                    if (self->screen_off_.load() && shake_score > kPickUpDeltaThreshold) {
+                        Application::GetInstance().Schedule([self]() { self->WakeScreen(); });
+                    }
+#endif
                 }
                 prev = cur;
                 has_prev = true;
@@ -731,31 +751,259 @@ private:
         }
     }
 
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+    // Screen blanking: one idle timeout, restarted by every touch and by leaving the settings
+    // page. Blanking also suspends emote rendering, so a dark screen costs no CPU.
+    void ArmScreenOffTimer() {
+        if (screen_off_timer_ == nullptr) {
+            return;
+        }
+        esp_timer_stop(screen_off_timer_);
+        if (screen_off_.load() || settings_page_ == nullptr) {
+            return;
+        }
+        // The settings page is a foreground activity, never blank it under the user's finger.
+        if (settings_page_->IsOpen()) {
+            return;
+        }
+        const int minutes = settings_page_->ScreenOffMinutes();
+        if (minutes <= 0) {
+            return;
+        }
+        esp_timer_start_once(screen_off_timer_,
+                             static_cast<uint64_t>(minutes) * 60ULL * 1000000ULL);
+    }
+
+    static void screen_off_timer_callback(void* arg) {
+        auto* self = static_cast<CyberVocat*>(arg);
+        if (self != nullptr) {
+            self->EnterScreenOff();
+        }
+    }
+
+    void EnterScreenOff() {
+        if (screen_off_.load()) {
+            return;
+        }
+        const auto state = Application::GetInstance().GetDeviceState();
+        if (state == kDeviceStateListening || state == kDeviceStateSpeaking ||
+            IsInWifiConfigMode()) {
+            // Someone is using the device (or the screen shows the setup QR code): try later.
+            ArmScreenOffTimer();
+            return;
+        }
+        screen_off_.store(true);
+        if (backlight_ != nullptr) {
+            saved_brightness_ = backlight_->brightness();
+            backlight_->SetBrightness(0, false);
+        }
+        if (lcd_panel_ != nullptr) {
+            esp_lcd_panel_disp_on_off(lcd_panel_, false);
+        }
+        emote::SetPanelSuspended(true);
+        ESP_LOGI(TAG, "Screen off after %d min idle",
+                 settings_page_ != nullptr ? settings_page_->ScreenOffMinutes() : 0);
+    }
+
+    void WakeScreen() {
+        if (!screen_off_.load()) {
+            return;
+        }
+        screen_off_.store(false);
+        if (lcd_panel_ != nullptr) {
+            esp_lcd_panel_disp_on_off(lcd_panel_, true);
+        }
+        emote::SetPanelSuspended(false);
+        if (display_ != nullptr) {
+            static_cast<emote::EmoteDisplay*>(display_)->RefreshAll();
+        }
+        if (backlight_ != nullptr) {
+            const uint8_t level = saved_brightness_ >= 5 ? saved_brightness_ : 70;
+            backlight_->SetBrightness(level, false);
+        }
+        ESP_LOGI(TAG, "Screen on");
+        ArmScreenOffTimer();
+    }
+#endif
+
     static void touch_event_task(void* arg) {
-        Cst816s* touchpad = static_cast<Cst816s*>(arg);
-        if (touchpad == nullptr) {
+        auto* self = static_cast<CyberVocat*>(arg);
+        if (self == nullptr || self->cst816s_ == nullptr) {
             ESP_LOGE(TAG, "Invalid touchpad pointer in touch_event_task");
             vTaskDelete(NULL);
             return;
         }
+        Cst816s* touchpad = self->cst816s_;
+        auto& app = Application::GetInstance();
+        auto& board = (CyberVocat&)Board::GetInstance();
+
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        // Thresholds for the only gestures that still exist on the closed page: pull down to
+        // open it, double tap to talk, swipe up to close it.
+        constexpr int kPullDownDy = 70;
+        constexpr int kPullDownStartY = 120;
+        constexpr int kSwipeUpDy = 70;
+        constexpr int kTapSlop = 24;
+        constexpr int64_t kTapMaxMs = 700;
+        constexpr int64_t kDoubleTapMs = 380;
+        constexpr int kDoubleTapSlop = 30;
+
+        // Tap bookkeeping for double-tap recognition: a single tap is deliberately inert now,
+        // it was the main cause of accidental interrupts.
+        int64_t last_tap_ms = 0;
+        int last_tap_x = 0;
+        int last_tap_y = 0;
+#endif
 
         while (true) {
-            if (touchpad->WaitForTouchEvent()) {
-                auto& app = Application::GetInstance();
-                auto& board = (CyberVocat&)Board::GetInstance();
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+            if (self->screen_off_.load()) {
+                // A blank screen wakes on the next touch, and that touch is consumed by waking:
+                // it must not also start a conversation or open the settings page.
+                touchpad->WaitForTouchEvent();
+                touchpad->UpdateTouchPoint();
+                touchpad->CheckTouchEvent();
+                self->WakeScreen();
+                continue;
+            }
+            auto* page = self->settings_page_.get();
+            if (page != nullptr && page->IsOpen()) {
+                // The page owns the screen: every touch is forwarded to it. The wait carries a
+                // timeout so a close request raised by the page itself (button, idle timer) is
+                // still serviced while nobody is touching.
+                bool swipe_up = false;
+                if (touchpad->WaitForTouchEvent(pdMS_TO_TICKS(100)) &&
+                    touchpad->UpdateTouchPoint()) {
+                    const auto event = touchpad->CheckTouchEvent();
+                    if (event == Cst816s::TOUCH_PRESS) {
+                        const auto& press = touchpad->GetTouchPoint();
+                        const int start_x = press.x;
+                        const int start_y = press.y;
+                        int last_x = start_x;
+                        int last_y = start_y;
+                        page->FeedTouch(true, last_x, last_y);
 
-                ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
-                if (!touchpad->UpdateTouchPoint())
-                    continue;
-                auto touch_event = touchpad->CheckTouchEvent();
+                        // A drag only moves the contact, it does not raise new INT events, so
+                        // the position is sampled here while the finger stays down.
+                        while (true) {
+                            vTaskDelay(pdMS_TO_TICKS(15));
+                            if (!touchpad->UpdateTouchPoint()) {
+                                break;
+                            }
+                            if (touchpad->CheckTouchEvent() != Cst816s::TOUCH_HOLD) {
+                                break;
+                            }
+                            const auto& point = touchpad->GetTouchPoint();
+                            last_x = point.x;
+                            last_y = point.y;
+                            page->FeedTouch(true, last_x, last_y);
+                        }
+                        page->FeedTouch(false, last_x, last_y);
 
-                if (touch_event == Cst816s::TOUCH_RELEASE) {
-                    if (app.GetDeviceState() == kDeviceStateStarting) {
-                        board.EnterWifiConfigMode();
-                    } else {
-                        app.ToggleChatState();
+                        const int dx = last_x - start_x;
+                        const int adx = dx < 0 ? -dx : dx;
+                        const int dy_up = start_y - last_y;
+                        swipe_up = dy_up > kSwipeUpDy && dy_up > adx;
+                    } else if (event == Cst816s::TOUCH_RELEASE) {
+                        page->FeedTouch(false, 0, 0);
                     }
                 }
+                // The page only raises the request; the NVS write happens here because the
+                // LVGL task stack is too small to hold a flash write.
+                page->HandlePendingCommits();
+                if (page->ConsumeWifiRequest()) {
+                    ESP_LOGI(TAG, "Wi-Fi config requested from the settings page");
+                    page->Hide();
+                    board.EnterWifiConfigMode();
+                } else if (swipe_up || page->ConsumeCloseRequest()) {
+                    page->Hide();
+                }
+                // Arm only once the page is closed: it keeps the screen lit while open.
+                self->ArmScreenOffTimer();
+                continue;
+            }
+#endif
+            if (!touchpad->WaitForTouchEvent()) {
+                continue;
+            }
+            ESP_LOGD(TAG, "Touch event, TP_PIN_NUM_INT: %d", gpio_get_level(TP_PIN_NUM_INT));
+            if (!touchpad->UpdateTouchPoint()) {
+                continue;
+            }
+            if (touchpad->CheckTouchEvent() != Cst816s::TOUCH_PRESS) {
+                continue;
+            }
+
+            const auto& press = touchpad->GetTouchPoint();
+            const int start_x = press.x;
+            const int start_y = press.y;
+            int last_x = start_x;
+            int last_y = start_y;
+            const int64_t press_ms = esp_timer_get_time() / 1000;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+            // Any interaction postpones the idle screen-off.
+            self->ArmScreenOffTimer();
+#endif
+
+            while (true) {
+                vTaskDelay(pdMS_TO_TICKS(15));
+                if (!touchpad->UpdateTouchPoint()) {
+                    break;
+                }
+                if (touchpad->CheckTouchEvent() != Cst816s::TOUCH_HOLD) {
+                    break;
+                }
+                const auto& point = touchpad->GetTouchPoint();
+                last_x = point.x;
+                last_y = point.y;
+            }
+
+            const int64_t release_ms = esp_timer_get_time() / 1000;
+            const int dx = last_x - start_x;
+            const int dy = last_y - start_y;
+            const int adx = dx < 0 ? -dx : dx;
+            const int ady = dy < 0 ? -dy : dy;
+
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+            if (page != nullptr) {
+                if (dy > kPullDownDy && dy > adx && start_y < kPullDownStartY) {
+                    if (page->Show()) {
+                        ESP_LOGI(TAG, "Pull down, settings page opened");
+                    }
+                    last_tap_ms = 0;
+                    continue;
+                }
+                if (adx > kTapSlop || ady > kTapSlop || release_ms - press_ms > kTapMaxMs) {
+                    last_tap_ms = 0;
+                    continue;
+                }
+                if (last_tap_ms != 0 && release_ms - last_tap_ms < kDoubleTapMs &&
+                    (start_x - last_tap_x < kDoubleTapSlop) &&
+                    (last_tap_x - start_x < kDoubleTapSlop) &&
+                    (start_y - last_tap_y < kDoubleTapSlop) &&
+                    (last_tap_y - start_y < kDoubleTapSlop)) {
+                    last_tap_ms = 0;
+                    ESP_LOGI(TAG, "Double tap, toggling chat");
+                    app.ToggleChatState();
+                    continue;
+                }
+                last_tap_ms = release_ms;
+                last_tap_x = start_x;
+                last_tap_y = start_y;
+                // A lone tap only enters Wi-Fi configuration, and only while the device has no
+                // network at all; otherwise it does nothing.
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    board.EnterWifiConfigMode();
+                }
+                continue;
+            }
+#endif
+            // Without the settings page there is nothing to draw it on; keep the legacy tap so
+            // the device stays usable in that degraded case.
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                board.EnterWifiConfigMode();
+            } else {
+                app.ToggleChatState();
             }
         }
     }
@@ -769,7 +1017,7 @@ private:
     void InitializeCst816sTouchPad() {
         cst816s_ = new Cst816s(i2c_bus_, 0x15);
 
-        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 4 * 1024, cst816s_, 5,
+        xTaskCreatePinnedToCore(touch_event_task, "touch_task", 5 * 1024, this, 5,
                                 &touch_task_handle_, 1);
 
         const gpio_config_t int_gpio_config = {.pin_bit_mask = (1ULL << TP_PIN_NUM_INT),
@@ -952,6 +1200,7 @@ private:
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        lcd_panel_ = panel;
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, false));
 #else
         esp_lcd_panel_disp_on_off(panel, true);
@@ -975,6 +1224,16 @@ private:
 #endif
         backlight_ = new PwmBacklight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         backlight_->RestoreBrightness();
+
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        auto* emote_display = static_cast<emote::EmoteDisplay*>(display_);
+        settings_page_ = std::make_unique<cyberai::LvglSettings>(
+            display_dma_panel_.get(), emote_display, backlight_, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        if (!settings_page_->Initialize()) {
+            ESP_LOGW(TAG, "Settings page unavailable, falling back to the plain tap");
+            settings_page_.reset();
+        }
+#endif
     }
 
 public:
@@ -1001,11 +1260,22 @@ public:
         // Delete objects
         delete charge_;
         delete cst816s_;
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        // The settings page borrows the panel and the emote handle, so it has to go first.
+        settings_page_.reset();
+#endif
         delete display_;
         // The board and its backlight live for the entire device lifetime.
 
         // Remove GPIO ISR handler
         gpio_isr_handler_remove(TP_PIN_NUM_INT);
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        if (screen_off_timer_ != nullptr) {
+            esp_timer_stop(screen_off_timer_);
+            esp_timer_delete(screen_off_timer_);
+            screen_off_timer_ = nullptr;
+        }
+#endif
         if (emotion_reset_timer_ != nullptr) {
             esp_timer_stop(emotion_reset_timer_);
             esp_timer_delete(emotion_reset_timer_);
@@ -1030,6 +1300,17 @@ public:
         };
         ESP_ERROR_CHECK(esp_timer_create(&emotion_timer_args, &emotion_reset_timer_));
 
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        const esp_timer_create_args_t screen_off_args = {
+            .callback = &CyberVocat::screen_off_timer_callback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "screen_off",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&screen_off_args, &screen_off_timer_));
+#endif
+
         InitializePower();
         InitializePowerKey();
         InitializeI2c();
@@ -1039,6 +1320,9 @@ public:
         InitializeCst816sTouchPad();
         InitializeMotion();
         InitializeHeadTouch();
+#if CONFIG_USE_EMOTE_MESSAGE_STYLE
+        ArmScreenOffTimer();
+#endif
     }
 
     virtual AudioCodec* GetAudioCodec() override {

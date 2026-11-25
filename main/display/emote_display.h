@@ -15,6 +15,20 @@ namespace emote {
 uint32_t GetFlushCount();
 int64_t GetMicrosecondsSinceLastFlush();
 
+// Panel hand-over, for a board page drawn by another renderer (LVGL) on the same panel.
+//
+// While suspended the emote renderer keeps its state machine running but never touches the
+// bus: every flush is reported as finished without drawing, so the render task keeps
+// flowing instead of blocking on a transfer that was never started. The page owns the
+// panel until the flag is cleared; ForceFullRefresh then repaints the whole scene over
+// whatever the page left behind.
+void SetPanelSuspended(bool suspended);
+bool IsPanelSuspended();
+
+// Called from the panel's on_color_trans_done, after the emote bookkeeping, so a page
+// renderer can wait for its own transfer instead of guessing. Pass nullptr to remove it.
+void SetFlushDoneHook(void (*hook)(void* ctx), void* ctx);
+
 class EmoteDisplay : public Display {
 public:
     using Display::SetPreviewImage;
