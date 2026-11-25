@@ -92,9 +92,12 @@ private:
     void AdjustVolume(int delta) {
         auto codec = GetAudioCodec();
         int volume = codec->output_volume() + delta;
-        volume %= 101;
-        if (volume < 0) {
-            volume += 101;
+        // 0 和 100 都必须能停到：越过上端回到 0，越过下端回到 100。
+        // 之前按 100 取模，加一路永远跳过 0（100+10 -> 10），减一路永远跳过 100（0-10 -> 90）。
+        if (volume > 100) {
+            volume = 0;
+        } else if (volume < 0) {
+            volume = 100;
         }
         codec->SetOutputVolume(volume);
         ShowVolumeHud(volume);
