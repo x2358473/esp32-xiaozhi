@@ -68,21 +68,22 @@ private:
     }
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Screen off only: the panel now owns the "息屏" timeout (0-30 min), and a 5 minute
+        // auto power off would cut the device off long before a longer timeout expires.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             auto display = GetDisplay();
             display->SetChatMessage("system", "");
             display->SetEmotion("sleepy");
-            GetBacklight()->SetBrightness(20);
+            // Fully dark instead of dimmed: the screen timeout is now user configurable
+            // from the settings panel, so "asleep" has to look like the screen is off.
+            GetBacklight()->SetBrightness(0);
         });
         power_save_timer_->OnExitSleepMode([this]() {
             auto display = GetDisplay();
             display->SetChatMessage("system", "");
             display->SetEmotion("neutral");
             GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            power_manager_->PowerOff();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -196,6 +197,13 @@ private:
                                     );
         display_->SetConfigModeHandler([this]() { EnterWifiConfigMode(); });
         display_->SetShutdownHandler([this]() { power_manager_->PowerOff(); });
+        // A dimmed screen is keyed off by any touch, otherwise the first tap after the
+        // timeout is swallowed and the user has to tap twice to wake the device.
+        display_->SetWakeHandler([this]() {
+            if (power_save_timer_ != nullptr) {
+                power_save_timer_->WakeUp();
+            }
+        });
     }
 
     void InitializeButtons() {

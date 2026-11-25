@@ -12,15 +12,35 @@ namespace {
 // 240x240 panel: a tap must stay well below the swipe threshold and be short.
 constexpr int32_t kTapMaxDistance = 15;
 constexpr uint32_t kTapMaxDurationMs = 700;
+// Two taps this close together (in time and space) make one double tap, which is the
+// only gesture that starts/interrupts the conversation.
+constexpr uint32_t kDoubleTapMaxIntervalMs = 400;
+constexpr int32_t kDoubleTapMaxDistance = 28;
 constexpr int32_t kSwipeMinDistance = 40;
 
-constexpr int32_t kSettingRowHeight = 44;
+// 6 + 26 (title) + 4 + 40 * 3 + 4 * 2 + 40 (buttons) + 6 leaves room on a 240px panel,
+// so the panel never scrolls and a slightly dragging tap still reaches its widget.
+constexpr int32_t kSettingRowHeight = 40;
 constexpr int32_t kSettingPanelPadding = 6;
-constexpr int32_t kSliderWidth = 160;
+constexpr int32_t kSliderWidth = 110;
 constexpr int32_t kSliderHeight = 14;
 constexpr int32_t kKnobSize = 22;
 constexpr int32_t kSliderExtClickArea = 16;
 constexpr int32_t kControlHitMargin = 12;
+// Reserve only: the value label sizes itself from its text, this is the room the slider
+// keeps free on the right so the knob never lands on top of the number.
+constexpr int32_t kValueLabelWidth = 38;
+constexpr int32_t kValueLabelGap = kValueLabelWidth + 14;
+constexpr int32_t kButtonWidth = 70;
+constexpr int32_t kButtonHeight = 38;
+constexpr int32_t kButtonExtClickArea = 6;
+
+constexpr int kSleepMaxMinutes = 30;
+// Matches PowerSaveTimer's own default (60 s), so an unset key shows 1 minute.
+constexpr int kSleepDefaultMinutes = 1;
+
+constexpr uint32_t kAecOnColor = 0x2E86DE;
+constexpr uint32_t kAecOffColor = 0x7F8C8D;
 
 bool PointInObj(const lv_obj_t* obj, const lv_point_t& point, int32_t margin) {
     if (obj == nullptr) {
@@ -83,6 +103,10 @@ void TouchLcdDisplay::IndevEventCb(lv_event_t* e) {
         lv_indev_get_point(indev, &self->press_point_);
         self->press_tick_ = lv_tick_get();
         self->press_on_control_ = self->IsPressOnControl(self->press_point_);
+        // Any touch while the panel is dimmed has to bring it back first.
+        if (self->wake_handler_) {
+            self->wake_handler_();
+        }
         return;
     }
 
@@ -109,14 +133,29 @@ void TouchLcdDisplay::HandleIndevReleased(const lv_point_t& point) {
         if (panel_open || elapsed > kTapMaxDurationMs) {
             return;
         }
-        ESP_LOGI(TAG, "Tap at (%d,%d), toggle chat", point.x, point.y);
-        Application::GetInstance().ToggleChatState();
+        // Only a double tap toggles the conversation. A single tap used to fire on every
+        // swipe that stopped a few pixels early, which made the device impossible to use.
+        bool is_double_tap =
+            has_last_tap_ && lv_tick_elaps(last_tap_tick_) <= kDoubleTapMaxIntervalMs &&
+            LV_ABS(point.x - last_tap_point_.x) <= kDoubleTapMaxDistance &&
+            LV_ABS(point.y - last_tap_point_.y) <= kDoubleTapMaxDistance;
+        if (is_double_tap) {
+            has_last_tap_ = false;
+            ESP_LOGI(TAG, "Double tap at (%d,%d), toggle chat", point.x, point.y);
+            Application::GetInstance().ToggleChatState();
+            return;
+        }
+        has_last_tap_ = true;
+        last_tap_tick_ = lv_tick_get();
+        last_tap_point_ = point;
+        ESP_LOGI(TAG, "Tap at (%d,%d), waiting for a second tap", point.x, point.y);
         return;
     }
 
     if (adx < kSwipeMinDistance && ady < kSwipeMinDistance) {
         return;  // neither a tap nor a long enough swipe
     }
+    has_last_tap_ = false;
 
     if (adx >= ady) {
         // Horizontal swipe. Inside the panel it does nothing: it used to be the
@@ -140,7 +179,7 @@ void TouchLcdDisplay::HandleIndevReleased(const lv_point_t& point) {
         return;
     }
 
-    // Swipe up is deliberately ignored: a tap already toggles the chat.
+    // Swipe up is deliberately ignored: a double tap toggles the chat.
 }
 
 bool TouchLcdDisplay::IsPressOnControl(const lv_point_t& point) const {
@@ -148,23 +187,23 @@ bool TouchLcdDisplay::IsPressOnControl(const lv_point_t& point) const {
         return false;
     }
     // The whole slider row is ours: LVGL only reacts on the knob, so the row is the
-    // surface that turns a press anywhere on the track into a value change.
-    if (PointInObj(volume_row_, point, 0)) {
+    // surface that turns a press anywhere on the track into a value change. Every
+    // control is checked with the same margin so there is no dead band between a
+    // widget and the gesture surface.
+    if (PointInObj(volume_row_, point, kControlHitMargin) ||
+        PointInObj(brightness_row_, point, kControlHitMargin) ||
+        PointInObj(sleep_row_, point, kControlHitMargin)) {
         return true;
     }
-    if (PointInObj(brightness_row_, point, 0)) {
+    if (PointInObj(volume_slider_, point, kControlHitMargin) ||
+        PointInObj(brightness_slider_, point, kControlHitMargin) ||
+        PointInObj(sleep_slider_, point, kControlHitMargin)) {
         return true;
     }
-    if (PointInObj(volume_slider_, point, kControlHitMargin)) {
+    if (PointInObj(aec_button_, point, kControlHitMargin)) {
         return true;
     }
-    if (PointInObj(brightness_slider_, point, kControlHitMargin)) {
-        return true;
-    }
-    if (PointInObj(aec_switch_, point, kControlHitMargin)) {
-        return true;
-    }
-    return PointInObj(button_row_, point, 0);
+    return PointInObj(button_row_, point, kControlHitMargin);
 }
 
 void TouchLcdDisplay::SetSliderFromPoint(lv_obj_t* slider, const lv_point_t& point) {
@@ -241,9 +280,11 @@ void TouchLcdDisplay::OpenSettingBox() {
     lv_obj_set_style_text_color(setting_box_, theme->text_color(), 0);
     lv_obj_set_style_text_font(setting_box_, text_font, 0);
     lv_obj_set_style_pad_all(setting_box_, kSettingPanelPadding, 0);
-    lv_obj_set_style_pad_row(setting_box_, 4, 0);
+    lv_obj_set_style_pad_row(setting_box_, 8, 0);
     lv_obj_set_flex_flow(setting_box_, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scroll_dir(setting_box_, LV_DIR_VER);
+    // The rows are laid out to fit 240px exactly: a scrollable panel turns every slightly
+    // moving tap into a scroll and the widget under the finger never sees the click.
+    lv_obj_set_scroll_dir(setting_box_, LV_DIR_NONE);
 
     // Title
     lv_obj_t* title = lv_label_create(setting_box_);
@@ -251,41 +292,30 @@ void TouchLcdDisplay::OpenSettingBox() {
     lv_obj_set_width(title, lv_pct(100));
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
 
-#if CONFIG_USE_DEVICE_AEC
-    {
-        lv_obj_t* row = CreateRow(setting_box_, kSettingRowHeight);
-        lv_obj_t* label = lv_label_create(row);
-        lv_label_set_text(label, "回声消除");
-        lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
-
-        aec_switch_ = lv_switch_create(row);
-        lv_obj_set_size(aec_switch_, 44, 24);
-        lv_obj_align(aec_switch_, LV_ALIGN_RIGHT_MID, -4, 0);
-        if (Application::GetInstance().GetAecMode() != kAecOff) {
-            lv_obj_add_state(aec_switch_, LV_STATE_CHECKED);
-        }
-        lv_obj_add_event_cb(aec_switch_, AecSwitchCb, LV_EVENT_VALUE_CHANGED, this);
-    }
-#endif
-
     {
         volume_row_ = CreateRow(setting_box_, kSettingRowHeight);
         lv_obj_t* label = lv_label_create(volume_row_);
         lv_label_set_text(label, "音量");
-        lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 2, 0);
 
         auto codec = Board::GetInstance().GetAudioCodec();
         int volume = (codec != nullptr) ? codec->output_volume() : 70;
 
+        volume_value_label_ = lv_label_create(volume_row_);
+        SetSmallFont(volume_value_label_);
+        lv_obj_align(volume_value_label_, LV_ALIGN_RIGHT_MID, -2, 0);
+        SetSliderValueLabel(volume_value_label_, volume);
+
         volume_slider_ = lv_slider_create(volume_row_);
         lv_obj_set_size(volume_slider_, kSliderWidth, kSliderHeight);
-        lv_obj_align(volume_slider_, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_align(volume_slider_, LV_ALIGN_RIGHT_MID, -kValueLabelGap, 0);
         lv_obj_set_style_width(volume_slider_, kKnobSize, LV_PART_KNOB);
         lv_obj_set_style_height(volume_slider_, kKnobSize, LV_PART_KNOB);
         lv_obj_set_style_radius(volume_slider_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_slider_set_range(volume_slider_, 0, 100);
         lv_slider_set_value(volume_slider_, volume, LV_ANIM_OFF);
         lv_obj_set_ext_click_area(volume_slider_, kSliderExtClickArea);
+        lv_obj_add_event_cb(volume_slider_, VolumeSliderValueCb, LV_EVENT_VALUE_CHANGED, this);
         // Applied on release only: SetOutputVolume() writes NVS on every call.
         lv_obj_add_event_cb(volume_slider_, VolumeSliderCb, LV_EVENT_RELEASED, this);
         AttachSliderRow(volume_row_, volume_slider_);
@@ -295,31 +325,73 @@ void TouchLcdDisplay::OpenSettingBox() {
         brightness_row_ = CreateRow(setting_box_, kSettingRowHeight);
         lv_obj_t* label = lv_label_create(brightness_row_);
         lv_label_set_text(label, "亮度");
-        lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 2, 0);
 
         auto backlight = Board::GetInstance().GetBacklight();
         int brightness = 50;
         if (backlight != nullptr) {
-            auto settings = Settings("display", false);
-            brightness = settings.GetInt("brightness", 50);
+            // Live value first: the PWR double click changes the brightness behind this
+            // panel's back, and NVS only knows what the slider itself last saved.
+            brightness = backlight->brightness();
+            if (brightness <= 0) {
+                auto settings = Settings("display", false);
+                brightness = settings.GetInt("brightness", 50);
+            }
             if (brightness <= 0) {
                 brightness = 50;
             }
         }
 
+        brightness_value_label_ = lv_label_create(brightness_row_);
+        SetSmallFont(brightness_value_label_);
+        lv_obj_align(brightness_value_label_, LV_ALIGN_RIGHT_MID, -2, 0);
+        SetSliderValueLabel(brightness_value_label_, brightness);
+
         brightness_slider_ = lv_slider_create(brightness_row_);
         lv_obj_set_size(brightness_slider_, kSliderWidth, kSliderHeight);
-        lv_obj_align(brightness_slider_, LV_ALIGN_RIGHT_MID, -4, 0);
+        lv_obj_align(brightness_slider_, LV_ALIGN_RIGHT_MID, -kValueLabelGap, 0);
         lv_obj_set_style_width(brightness_slider_, kKnobSize, LV_PART_KNOB);
         lv_obj_set_style_height(brightness_slider_, kKnobSize, LV_PART_KNOB);
         lv_obj_set_style_radius(brightness_slider_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_slider_set_range(brightness_slider_, 1, 100);
         lv_slider_set_value(brightness_slider_, brightness, LV_ANIM_OFF);
         lv_obj_set_ext_click_area(brightness_slider_, kSliderExtClickArea);
+        lv_obj_add_event_cb(brightness_slider_, BrightnessSliderValueCb, LV_EVENT_VALUE_CHANGED,
+                            this);
         lv_obj_add_event_cb(brightness_slider_, BrightnessSliderCb, LV_EVENT_VALUE_CHANGED, this);
         lv_obj_add_event_cb(brightness_slider_, BrightnessSliderReleasedCb, LV_EVENT_RELEASED,
                             this);
         AttachSliderRow(brightness_row_, brightness_slider_);
+    }
+
+    {
+        // Replaces the old AEC switch row: the idle screen timeout is the setting that
+        // actually gets touched on a battery device, and AEC moved to a segmented button.
+        sleep_row_ = CreateRow(setting_box_, kSettingRowHeight);
+        lv_obj_t* label = lv_label_create(sleep_row_);
+        lv_label_set_text(label, "息屏");
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 2, 0);
+
+        int sleep_minutes = 0;
+        LoadSleepMinutes(sleep_minutes);
+
+        sleep_value_label_ = lv_label_create(sleep_row_);
+        SetSmallFont(sleep_value_label_);
+        lv_obj_align(sleep_value_label_, LV_ALIGN_RIGHT_MID, -2, 0);
+        SetSleepValueLabel(sleep_value_label_, sleep_minutes);
+
+        sleep_slider_ = lv_slider_create(sleep_row_);
+        lv_obj_set_size(sleep_slider_, kSliderWidth, kSliderHeight);
+        lv_obj_align(sleep_slider_, LV_ALIGN_RIGHT_MID, -kValueLabelGap, 0);
+        lv_obj_set_style_width(sleep_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_height(sleep_slider_, kKnobSize, LV_PART_KNOB);
+        lv_obj_set_style_radius(sleep_slider_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        lv_slider_set_range(sleep_slider_, 0, kSleepMaxMinutes);
+        lv_slider_set_value(sleep_slider_, sleep_minutes, LV_ANIM_OFF);
+        lv_obj_set_ext_click_area(sleep_slider_, kSliderExtClickArea);
+        lv_obj_add_event_cb(sleep_slider_, SleepSliderValueCb, LV_EVENT_VALUE_CHANGED, this);
+        lv_obj_add_event_cb(sleep_slider_, SleepSliderReleasedCb, LV_EVENT_RELEASED, this);
+        AttachSliderRow(sleep_row_, sleep_slider_);
     }
 
     {
@@ -328,9 +400,12 @@ void TouchLcdDisplay::OpenSettingBox() {
         lv_obj_set_flex_align(button_row_, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
                               LV_FLEX_ALIGN_CENTER);
 
-        CreateButton(button_row_, "配网", lv_color_hex(0x2E86DE), ConfigModeBtnCb);
-        CreateButton(button_row_, "关机", lv_color_hex(0xE74C3C), ShutdownBtnCb);
-        CreateButton(button_row_, "关闭", lv_color_hex(0x7F8C8D), CloseBtnCb);
+        CreateButton(button_row_, "配网", lv_color_hex(0x2E86DE), ConfigModeBtnCb, LV_EVENT_CLICKED);
+        CreateButton(button_row_, "关机", lv_color_hex(0xE74C3C), ShutdownBtnCb, LV_EVENT_CLICKED);
+        // AEC kept its place at the end of the row, but as a toggle button whose colour
+        // states the current mode better than a switch did on this 240px panel.
+        aec_button_ = CreateButton(button_row_, "AEC", lv_color_hex(0x7F8C8D), AecButtonCb, LV_EVENT_CLICKED);
+        UpdateAecButtonColor();
     }
 }
 
@@ -346,9 +421,14 @@ void TouchLcdDisplay::CloseSettingBox() {
     button_row_ = nullptr;
     volume_row_ = nullptr;
     brightness_row_ = nullptr;
+    sleep_row_ = nullptr;
     volume_slider_ = nullptr;
     brightness_slider_ = nullptr;
-    aec_switch_ = nullptr;
+    sleep_slider_ = nullptr;
+    volume_value_label_ = nullptr;
+    brightness_value_label_ = nullptr;
+    sleep_value_label_ = nullptr;
+    aec_button_ = nullptr;
 }
 
 void TouchLcdDisplay::AttachSliderRow(lv_obj_t* row, lv_obj_t* slider) {
@@ -374,20 +454,105 @@ lv_obj_t* TouchLcdDisplay::CreateRow(lv_obj_t* parent, int32_t height) {
 }
 
 lv_obj_t* TouchLcdDisplay::CreateButton(lv_obj_t* parent, const char* text, lv_color_t color,
-                                        lv_event_cb_t cb) {
+                                        lv_event_cb_t cb, lv_event_code_t trigger) {
     lv_obj_t* button = lv_button_create(parent);
-    lv_obj_set_size(button, 68, 36);
+    lv_obj_set_size(button, kButtonWidth, kButtonHeight);
     lv_obj_set_style_bg_color(button, color, 0);
     lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(button, 6, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
-    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, this);
+    // Trigger is a parameter: the panel actions use CLICKED, so a finger that drifts in
+    // from the row above (the 息屏 slider sits right above them) cannot fire 配网/关机.
+    // The enlarged hit area keeps the buttons easy to hit without several attempts.
+    lv_obj_add_event_cb(button, cb, trigger, this);
+    lv_obj_set_ext_click_area(button, kButtonExtClickArea);
 
     lv_obj_t* label = lv_label_create(button);
     lv_label_set_text(label, text);
     lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(label);
     return button;
+}
+
+void TouchLcdDisplay::SetSmallFont(lv_obj_t* label) {
+    if (label == nullptr) {
+        return;
+    }
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+}
+
+void TouchLcdDisplay::SetSliderValueLabel(lv_obj_t* label, int value) {
+    if (label == nullptr) {
+        return;
+    }
+    lv_label_set_text_fmt(label, "%d%%", value);
+}
+
+void TouchLcdDisplay::SetSleepValueLabel(lv_obj_t* label, int minutes) {
+    if (label == nullptr) {
+        return;
+    }
+    if (minutes <= 0) {
+        lv_label_set_text(label, "OFF");
+    } else {
+        lv_label_set_text_fmt(label, "%dm", minutes);
+    }
+}
+
+void TouchLcdDisplay::LoadSleepMinutes(int& minutes) const {
+    // 0 means "never" and PowerSaveTimer maps it to -1. An unset key must show the value
+    // the timer is really using, not 0, or the slider would lie about the default.
+    auto settings = Settings("wifi", false);
+    int value = settings.GetInt("sleep_dim_min", kSleepDefaultMinutes);
+    if (value < 0) {
+        value = kSleepDefaultMinutes;
+    }
+    if (value > kSleepMaxMinutes) {
+        value = 0;
+    }
+    minutes = value;
+}
+
+void TouchLcdDisplay::UpdateAecButtonColor() {
+    if (aec_button_ == nullptr) {
+        return;
+    }
+    bool enabled = Application::GetInstance().GetAecMode() != kAecOff;
+    lv_obj_set_style_bg_color(aec_button_, lv_color_hex(enabled ? kAecOnColor : kAecOffColor), 0);
+}
+
+void TouchLcdDisplay::VolumeSliderValueCb(lv_event_t* e) {
+    auto self = static_cast<TouchLcdDisplay*>(lv_event_get_user_data(e));
+    if (self == nullptr) {
+        return;
+    }
+    SetSliderValueLabel(self->volume_value_label_, lv_slider_get_value(lv_event_get_target_obj(e)));
+}
+
+void TouchLcdDisplay::BrightnessSliderValueCb(lv_event_t* e) {
+    auto self = static_cast<TouchLcdDisplay*>(lv_event_get_user_data(e));
+    if (self == nullptr) {
+        return;
+    }
+    SetSliderValueLabel(self->brightness_value_label_,
+                        lv_slider_get_value(lv_event_get_target_obj(e)));
+}
+
+void TouchLcdDisplay::SleepSliderValueCb(lv_event_t* e) {
+    auto self = static_cast<TouchLcdDisplay*>(lv_event_get_user_data(e));
+    if (self == nullptr) {
+        return;
+    }
+    SetSleepValueLabel(self->sleep_value_label_, lv_slider_get_value(lv_event_get_target_obj(e)));
+}
+
+void TouchLcdDisplay::SleepSliderReleasedCb(lv_event_t* e) {
+    int minutes = lv_slider_get_value(lv_event_get_target_obj(e));
+    // PowerSaveTimer::ApplySettings() polls this key once per second, so writing it here
+    // is enough for the change to take effect without touching the shared component.
+    auto settings = Settings("wifi", true);
+    settings.SetInt("sleep_dim_min", minutes);
+    ESP_LOGI(TAG, "Sleep dim timeout set to %d minute(s)", minutes);
 }
 
 void TouchLcdDisplay::VolumeSliderCb(lv_event_t* e) {
@@ -420,12 +585,16 @@ void TouchLcdDisplay::BrightnessSliderReleasedCb(lv_event_t* e) {
     settings.SetInt("brightness", brightness);
 }
 
-void TouchLcdDisplay::AecSwitchCb(lv_event_t* e) {
-    lv_obj_t* sw = lv_event_get_target_obj(e);
-    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+void TouchLcdDisplay::AecButtonCb(lv_event_t* e) {
+    auto self = static_cast<TouchLcdDisplay*>(lv_event_get_user_data(e));
+    if (self == nullptr) {
+        return;
+    }
     auto& app = Application::GetInstance();
-    app.SetAecMode(enabled ? kAecOnDeviceSide : kAecOff);
-    ESP_LOGI(TAG, "AEC %s", enabled ? "on" : "off");
+    bool enabled = app.GetAecMode() != kAecOff;
+    app.SetAecMode(enabled ? kAecOff : kAecOnDeviceSide);
+    ESP_LOGI(TAG, "AEC %s", enabled ? "off" : "on");
+    self->UpdateAecButtonColor();
 }
 
 void TouchLcdDisplay::ConfigModeBtnCb(lv_event_t* e) {
@@ -445,12 +614,4 @@ void TouchLcdDisplay::ShutdownBtnCb(lv_event_t* e) {
     }
     ESP_LOGI(TAG, "Power off");
     self->shutdown_handler_();
-}
-
-void TouchLcdDisplay::CloseBtnCb(lv_event_t* e) {
-    auto self = static_cast<TouchLcdDisplay*>(lv_event_get_user_data(e));
-    if (self == nullptr) {
-        return;
-    }
-    self->CloseSettingBox();
 }
